@@ -38,6 +38,7 @@ emplence-backend/
 │   │   ├── env.js                  # Loads .env.local then .env (or ENV_FILE)
 │   │   └── db.js                   # PostgreSQL pool, TLS/SSL config, withTransaction()
 │   ├── controllers/
+│   │   ├── authController.js       # POST /api/auth/login (JWT)
 │   │   ├── helloController.js      # GET /hello
 │   │   ├── companyController.js    # /api/companies
 │   │   ├── locationController.js   # /api/companies-locations
@@ -53,7 +54,8 @@ emplence-backend/
 │   │       ├── 004_create_users.sql
 │   │       └── 005_seed_master_roles.sql
 │   ├── middleware/
-│   │   └── adminKey.js             # x-admin-key guard for role management
+│   │   ├── adminKey.js             # x-admin-key validation (bootstrap access)
+│   │   └── auth.js                 # JWT sign/verify + company scope & hierarchy guards
 │   ├── models/
 │   │   ├── companyModel.js         # master_companies
 │   │   ├── roleModel.js            # master_roles (+ ensureDefaultRoles)
@@ -61,7 +63,8 @@ emplence-backend/
 │   │   ├── userModel.js            # users (bcrypt hashing, EMPLOYEE role)
 │   │   └── databaseModel.js        # startup connection ping
 │   ├── routes/
-│   │   ├── index.js                # Mounts /hello and /api/*
+│   │   ├── index.js                # Mounts /hello, /api/auth and the /api/* resources
+│   │   ├── authRoutes.js           # /api/auth/login
 │   │   ├── helloRoutes.js          # /hello
 │   │   ├── companyRoutes.js        # /api/companies
 │   │   ├── locationRoutes.js       # /api/companies-locations
@@ -147,7 +150,9 @@ All credentials come from env files (never hardcoded, never committed).
 | `DB_CONNECT_TIMEOUT_MS`      | No       | `10000`   | Connection attempt timeout in milliseconds.                                 |
 | `SERVER_HOST`                | No       | all interfaces | Bind address; `127.0.0.1` limits access to this machine.              |
 | `BCRYPT_SALT_ROUNDS`         | No       | `10`      | bcrypt cost factor used when hashing user passwords.                        |
-| `ADMIN_API_KEY`              | No       | –         | Shared key for `x-admin-key`; unset disables role management (503).         |
+| `ADMIN_API_KEY`              | No       | –         | Bootstrap `x-admin-key` for the platform administrator; unset disables it.  |
+| `JWT_SECRET`                 | No*      | –         | Signing secret for login tokens; **required** for `POST /api/auth/login` (503 without it). |
+| `AUTH_TOKEN_TTL_SECONDS`     | No       | `28800`   | Login token lifetime (8 h).                                                 |
 | `ENV_FILE`                   | No       | –         | Load one explicit env file instead of `.env.local` + `.env`.                |
 
 Example `.env.local` (local Docker, no TLS):
@@ -276,7 +281,7 @@ Schema is versioned in `src/database/migrations/` and applied with `npm run db:m
 | Table | Purpose | Key constraints |
 | --- | --- | --- |
 | `master_companies` | Registered companies (root table) | PK `id`, UNIQUE `company_code` |
-| `master_roles` | Available user roles (`ADMIN`, `EMPLOYEE`) | PK `id`, UNIQUE `role_code` |
+| `master_roles` | Global roles (`ADMIN`, `EMPLOYEE`) and per-company roles | PK `id`, UNIQUE (`company_id`, `role_code`) NULLS NOT DISTINCT, FK `company_id`, CHECK `hierarchy_level > 0` |
 | `companies_locations` | Branches/offices of a company | PK `id`, FK `company_id` → `master_companies`, UNIQUE (`company_id`, `location_code`) |
 | `users` | Accounts with hashed passwords + assignment | PK `id`, UNIQUE `username` (+ case-insensitive), FKs `role_id`, `company_id`, `location_id` |
 
@@ -290,12 +295,14 @@ inserting, and map constraints to HTTP-friendly errors (`src/utils/errors.js`).
 
 Database-level rules worth knowing:
 
-- `userModel.register()` hashes passwords with bcrypt and always assigns `EMPLOYEE`; a role cannot be
-  supplied by the caller, so public registration can never create an `ADMIN`.
+- `userModel.register()` hashes passwords with bcrypt and always assigns the global `EMPLOYEE`; a role
+  cannot be supplied by the caller, so public registration can never create an `ADMIN`.
 - A user's `location_id` is rejected unless it belongs to the supplied `company_id`
   (and the database also enforces `location_id ⇒ company_id`).
-- Default roles are seeded idempotently (`ON CONFLICT (role_code) DO NOTHING`) by migration `005`,
-  at startup, and by `npm run db:seed`.
+- `master_roles.company_id` is `NULL` for global roles and set for company roles; role codes are unique
+  per company, so two companies can both own a `SUPERVISOR` role.
+- Default roles are seeded idempotently (`ON CONFLICT (company_id, role_code) DO NOTHING`) by
+  migrations `005`/`006`, at startup, and by `npm run db:seed`.
 
 Full column list, ER diagram, and the migration/backward-compatibility policy live in
 **[DATABASE_DESIGN.md](DATABASE_DESIGN.md)**.
@@ -332,23 +339,34 @@ and foreign-key behaviour. Summary:
 
 | Method | Endpoint | Purpose | Auth |
 | --- | --- | --- | --- |
-| `GET` | `/hello` | Liveness check (original endpoint) | – |
-| `GET` | `/api/companies` | List companies (`?includeInvalid=true`) | – |
-| `POST` | `/api/companies` | Create a company | – |
-| `PUT` | `/api/companies/:id` | Update a company | – |
-| `GET` | `/api/companies-locations` | List locations (`?companyId=&includeInvalid=`) | – |
-| `POST` | `/api/companies-locations` | Create a location for a company | – |
-| `PUT` | `/api/companies-locations/:id` | Update a location (`companyId` immutable) | – |
-| `GET` | `/api/roles` | List roles | – |
-| `POST` | `/api/roles` | Create a role | `x-admin-key` |
-| `PUT` | `/api/roles/:id` | Update a role | `x-admin-key` |
-| `GET` | `/api/users` | List users (`?companyId=&locationId=&includeInvalid=`) | – |
-| `POST` | `/api/users` | Create a user (role defaults to `EMPLOYEE`) | `x-admin-key` for non-`EMPLOYEE` roles |
-| `PUT` | `/api/users/:id` | Update a user | `x-admin-key` for privileged role changes |
+| `GET` | `/hello` | Liveness check (original endpoint) | public |
+| `POST` | `/api/auth/login` | Log in, returns a company-scoped JWT | public |
+| `GET` | `/api/companies` | List companies (sub-admin: own only) | any actor |
+| `POST` | `/api/companies` | Create a company | platform admin |
+| `PUT` | `/api/companies/:id` | Update a company | platform admin |
+| `GET` | `/api/companies-locations` | List locations (`?companyId=&includeInvalid=`) | any actor (scoped) |
+| `POST` | `/api/companies-locations` | Create a location | any actor (company forced) |
+| `PUT` | `/api/companies-locations/:id` | Update a location (`companyId` immutable) | any actor (scoped) |
+| `GET` | `/api/roles` | List roles (global + own company) | any actor (scoped) |
+| `POST` | `/api/roles` | Create a role (subordinate level) | `ADMIN` actor |
+| `PUT` | `/api/roles/:id` | Update a role (own company) | `ADMIN` actor |
+| `GET` | `/api/users` | List users (`?companyId=&locationId=&includeInvalid=`) | any actor (scoped) |
+| `POST` | `/api/users` | Create a user (company sub-admin/staff) | `ADMIN` actor (scoped) |
+| `PUT` | `/api/users/:id` | Update a user | `ADMIN` actor (scoped) |
 
-> Roles stay backend-controlled: `POST/PUT /api/roles` (and assigning a non-`EMPLOYEE` role to a user)
-> require the `x-admin-key` header whose value is `ADMIN_API_KEY`. Without that variable the role
-> write endpoints return `503`.
+> **Actors.** `x-admin-key: $ADMIN_API_KEY` is the bootstrap platform administrator (all companies).
+> A logged-in user sends `Authorization: Bearer <token>`; if the account has a company, the token is
+> scoped to it, so **company sub-admins never see other companies' data** (`403` on cross-company
+> access) and can only grant roles below their own hierarchy level.
+
+### Company sub-admins and role hierarchy (summary)
+
+- Platform admin creates the company, then a **sub-admin**: `POST /api/users` with
+  `roleCode: "ADMIN"` **and** `companyId` (via `x-admin-key`).
+- The sub-admin logs in with `POST /api/auth/login`; the returned token carries `companyId`.
+- With that token the sub-admin manages only its own locations/roles/users, e.g. creates
+  `SUPERVISOR` (`hierarchyLevel: 50`) and `WORKER` (`100`) roles, and assigns them to new users.
+- `ADMIN` has `hierarchyLevel: 1`, so a sub-admin can never create/promote another admin.
 
 ### `GET /hello`
 

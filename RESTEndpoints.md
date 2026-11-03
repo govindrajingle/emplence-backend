@@ -10,12 +10,14 @@ On a phone/another device on the same Wi-Fi use the LAN address printed at start
 (for example `http://192.168.1.22:3000`) — see [LOCAL_SETUP.md §16](LOCAL_SETUP.md#16-access-hello-from-an-android-phone-on-the-same-wi-fi).
 
 - [Conventions](#conventions)
+- [Authentication and company tenancy](#authentication-and-company-tenancy)
 - [Endpoint summary](#endpoint-summary)
 - [1. GET /hello](#1-get-hello)
-- [2. Companies](#2-companies)
-- [3. Companies locations](#3-companies-locations)
-- [4. Roles](#4-roles)
-- [5. Users](#5-users)
+- [2. POST /api/auth/login](#2-post-apiauthlogin)
+- [3. Companies](#3-companies)
+- [4. Companies locations](#4-companies-locations)
+- [5. Roles](#5-roles)
+- [6. Users](#6-users)
 - [Foreign key behaviour](#foreign-key-behaviour)
 - [Status codes and errors](#status-codes-and-errors)
 
@@ -30,26 +32,128 @@ On a phone/another device on the same Wi-Fi use the LAN address printed at start
 - **PUT semantics:** partial update — only the fields present in the body are changed. Sending `{}` (or
   only unknown keys) returns `400`.
 - **Route naming:** the locations resource is `/api/companies-locations` (plural, hyphenated).
-- **Protection:** role management and privileged role assignment require the `x-admin-key` header
-  whose value is the server's `ADMIN_API_KEY` environment variable.
+- **Authentication:** every `/api/*` route except `POST /api/auth/login` requires either a
+  `Authorization: Bearer <token>` header or the bootstrap `x-admin-key` header. `/hello` stays public.
+
+## Authentication and company tenancy
+
+### Two kinds of caller
+
+| Caller | Credential | Scope | Authority |
+| --- | --- | --- | --- |
+| Platform administrator (bootstrap) | `x-admin-key: $ADMIN_API_KEY` | all companies | highest (hierarchy 0) |
+| Global admin user (created with no company) | Bearer token, `companyId: null` | all companies | hierarchy of its role (`ADMIN` = 1) |
+| **Company sub-admin** (created with a company) | Bearer token carrying that `companyId` | **only its own company** | its role's hierarchy level |
+
+A company sub-admin can never see or change another company's companies, locations, roles or users —
+these requests are answered with `403 Forbidden`. Requests are also pinned automatically: when a
+sub-admin omits `companyId`, it is filled with its own company.
+
+### `POST /api/auth/login`
+
+Public endpoint. Verifies the bcrypt password hash and returns a JWT.
+
+| Body field | Type | Required |
+| --- | --- | --- |
+| `username` | string (3–100, case-insensitive lookup) | ✅ |
+| `password` | string | ✅ |
+
+```bash
+curl -X POST http://localhost:3000/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"subadmin_acme","password":"secret123"}'
+```
+
+**Response — `200 OK`**
+
+```json
+{
+  "data": {
+    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "tokenType": "Bearer",
+    "expiresInSeconds": 28800,
+    "user": {
+      "id": 7,
+      "username": "subadmin_acme",
+      "roleCode": "ADMIN",
+      "roleScope": "company",
+      "hierarchyLevel": 1,
+      "companyId": 3,
+      "companyName": "Acme Corp"
+    }
+  }
+}
+```
+
+Errors: `400` missing field · `401` unknown username / wrong password / inactive user ·
+`403` the account's company is deactivated · `503` `JWT_SECRET` not configured.
+
+The token contains `sub` (user id), `roleCode`, `companyId` and `hierarchyLevel`; it is signed with
+`JWT_SECRET` and expires after `AUTH_TOKEN_TTL_SECONDS` (default 28800 = 8 h).
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:3000/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"subadmin_acme","password":"secret123"}' \
+  | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).data.token')
+
+curl -s http://localhost:3000/api/users -H "Authorization: Bearer $TOKEN"
+```
+
+### Creating a company sub-admin (platform administrator)
+
+```bash
+# x-admin-key = ADMIN_API_KEY from your .env file
+curl -X POST http://localhost:3000/api/users \
+  -H 'Content-Type: application/json' \
+  -H "x-admin-key: $ADMIN_API_KEY" \
+  -d '{"username":"subadmin_acme","password":"secret123","roleCode":"ADMIN","companyId":3}'
+```
+
+The resulting user has `role_code = ADMIN` **and** `company_id = 3`, which is what makes it a
+sub-admin: on login the token is scoped to company 3.
+
+### Role hierarchy
+
+`master_roles.hierarchy_level` orders authority — **lower number = more authority**:
+
+| Role | Scope | `hierarchyLevel` |
+| --- | --- | --- |
+| `ADMIN` | global (seeded) | `1` |
+| company roles created by a sub-admin (e.g. `SUPERVISOR`) | company | e.g. `50` |
+| `EMPLOYEE` | global (seeded) | `100` |
+
+Rules enforced by the API:
+
+- A sub-admin can only create/update roles **of its own company** and only with
+  `hierarchyLevel` **greater than its own** (it cannot create a peer or a superior).
+- A sub-admin can only assign roles whose `hierarchyLevel` is greater than its own, so it can never
+  create another `ADMIN` (or a role above itself).
+- A sub-admin cannot modify a user whose authority is equal to or higher than its own.
+- Global actors (`x-admin-key`, global admin) are not restricted by hierarchy.
 
 ## Endpoint summary
 
-| # | Method | Endpoint | Purpose | Auth |
-| --- | --- | --- | --- | --- |
-| 1 | `GET` | `/hello` | Liveness check (original endpoint) | – |
-| 2 | `GET` | `/api/companies` | List companies | – |
-| 3 | `POST` | `/api/companies` | Create a company | – |
-| 4 | `PUT` | `/api/companies/:id` | Update a company | – |
-| 5 | `GET` | `/api/companies-locations` | List locations (optionally by company) | – |
-| 6 | `POST` | `/api/companies-locations` | Create a location for a company | – |
-| 7 | `PUT` | `/api/companies-locations/:id` | Update a location | – |
-| 8 | `GET` | `/api/roles` | List roles | – |
-| 9 | `POST` | `/api/roles` | Create a role | `x-admin-key` |
-| 10 | `PUT` | `/api/roles/:id` | Update a role | `x-admin-key` |
-| 11 | `GET` | `/api/users` | List users (optionally by company/location) | – |
-| 12 | `POST` | `/api/users` | Create a user | `x-admin-key` only for non-`EMPLOYEE` roles |
-| 13 | `PUT` | `/api/users/:id` | Update a user | `x-admin-key` only for role changes to non-`EMPLOYEE` |
+`Auth` column: **public** = no credentials, **any actor** = Bearer token or `x-admin-key`,
+**admin** = `ADMIN` role actor (global admin or company sub-admin), **platform** = bootstrap key or
+company-less admin only.
+
+| # | Method | Endpoint | Purpose | Auth | Company scoped |
+| --- | --- | --- | --- | --- | --- |
+| 1 | `GET` | `/hello` | Liveness check (original endpoint) | public | – |
+| 2 | `POST` | `/api/auth/login` | Exchange username/password for a token | public | – |
+| 3 | `GET` | `/api/companies` | List companies | any actor | yes (sub-admin sees only its own) |
+| 4 | `POST` | `/api/companies` | Create a company | platform | – |
+| 5 | `PUT` | `/api/companies/:id` | Update a company | platform | – |
+| 6 | `GET` | `/api/companies-locations` | List locations | any actor | yes |
+| 7 | `POST` | `/api/companies-locations` | Create a location | any actor | yes (forced) |
+| 8 | `PUT` | `/api/companies-locations/:id` | Update a location | any actor | yes |
+| 9 | `GET` | `/api/roles` | List roles | any actor | yes (global + own company) |
+| 10 | `POST` | `/api/roles` | Create a role | admin | yes (forced; subordinate level) |
+| 11 | `PUT` | `/api/roles/:id` | Update a role | admin | yes (own company roles only) |
+| 12 | `GET` | `/api/users` | List users | any actor | yes |
+| 13 | `POST` | `/api/users` | Create a user | admin | yes (forced; subordinate role) |
+| 14 | `PUT` | `/api/users/:id` | Update a user | admin | yes (own company, lower authority) |
 
 ## 1. GET /hello
 
@@ -75,9 +179,25 @@ Unknown routes return JSON `404`:
 { "message": "Route GET /api/unknown not found." }
 ```
 
-## 2. Companies
+## 2. POST /api/auth/login
 
-### 2.1 `GET /api/companies`
+Documented in detail in [Authentication and company tenancy](#authentication-and-company-tenancy):
+`{ "username": "...", "password": "..." }` → `200` with a Bearer token scoped to the user's company.
+This is the entry point for **company sub-admins**: the token carries their `companyId`, which pins
+every later request to that company.
+
+```bash
+curl -X POST http://localhost:3000/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"subadmin_acme","password":"secret123"}'
+```
+
+## 3. Companies
+
+Company master records are created/maintained by the **platform administrator** only.
+A company sub-admin may call `GET /api/companies`, but only ever sees its own company.
+
+### 3.1 `GET /api/companies`
 
 Lists companies ordered by `company_name`.
 
@@ -107,7 +227,9 @@ curl 'http://localhost:3000/api/companies?includeInvalid=true'
 }
 ```
 
-### 2.2 `POST /api/companies`
+### 3.2 `POST /api/companies`
+
+**Auth:** platform administrator (`x-admin-key` or a company-less admin token).
 
 | Body field | Type | Required | Constraint |
 | --- | --- | --- | --- |
@@ -117,6 +239,7 @@ curl 'http://localhost:3000/api/companies?includeInvalid=true'
 ```bash
 curl -X POST http://localhost:3000/api/companies \
   -H 'Content-Type: application/json' \
+  -H "x-admin-key: $ADMIN_API_KEY" \
   -d '{"companyName":"Acme Corp","companyCode":"ACME001"}'
 ```
 
@@ -136,7 +259,9 @@ curl -X POST http://localhost:3000/api/companies \
 
 Errors: `400` missing/blank name or code · `409` duplicate `companyCode`.
 
-### 2.3 `PUT /api/companies/:id`
+### 3.3 `PUT /api/companies/:id`
+
+**Auth:** platform administrator only (a sub-admin receives `403`).
 
 | Body field | Type | Required | Constraint |
 | --- | --- | --- | --- |
@@ -147,6 +272,7 @@ Errors: `400` missing/blank name or code · `409` duplicate `companyCode`.
 ```bash
 curl -X PUT http://localhost:3000/api/companies/1 \
   -H 'Content-Type: application/json' \
+  -H "x-admin-key: $ADMIN_API_KEY" \
   -d '{"companyName":"Acme Corporation","isValid":true}'
 ```
 
@@ -160,13 +286,13 @@ Errors: `400` no updatable field / invalid value · `404` company not found ·
 > `is_valid = TRUE`.
 
 
-## 3. Companies locations
+## 4. Companies locations
 
 A location always belongs to exactly one company (`companies_locations.company_id` →
 `master_companies.id`). `location_code` is unique **per company**, so `HO` may exist for two
 different companies but not twice for the same one.
 
-### 3.1 `GET /api/companies-locations`
+### 4.1 `GET /api/companies-locations`
 
 | Query parameter | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -196,7 +322,7 @@ curl 'http://localhost:3000/api/companies-locations?companyId=1'
 }
 ```
 
-### 3.2 `POST /api/companies-locations`
+### 4.2 `POST /api/companies-locations`
 
 | Body field | Type | Required | Constraint |
 | --- | --- | --- | --- |
@@ -215,7 +341,7 @@ curl -X POST http://localhost:3000/api/companies-locations \
 Errors: `400` missing field / unknown or inactive `companyId` · `409` duplicate
 `(companyId, locationCode)` for that company.
 
-### 3.3 `PUT /api/companies-locations/:id`
+### 4.3 `PUT /api/companies-locations/:id`
 
 | Body field | Type | Required | Constraint |
 | --- | --- | --- | --- |
@@ -240,53 +366,75 @@ Errors: `400` no updatable field / blank value / `companyId` supplied · `404` l
 > company instead.
 
 
-## 4. Roles
+## 5. Roles
 
-Roles drive `users.role_id`. Because the project rules require roles to be managed through
-backend-controlled functionality only, **create/update require the admin key**:
+Roles are the backbone of company tenancy:
 
-```bash
-x-admin-key: $ADMIN_API_KEY
-```
+- **Global roles** (`company_id = null`, seeded): `ADMIN` (hierarchy `1`) and `EMPLOYEE` (`100`).
+- **Company roles** (`company_id = <company>`): created by that company's sub-admin, e.g.
+  `SUPERVISOR` (`50`), `WORKER` (`100`). A code may exist in several companies because uniqueness is
+  `(company_id, role_code)`.
 
-- `ADMIN_API_KEY` unset on the server → role write endpoints answer `503` (fail closed).
-- Wrong/missing header → `401`.
-- Reads (`GET /api/roles`) stay public so clients can display role names.
+**Who can do what**
 
-### 4.1 `GET /api/roles`
+| Operation | Global actor (`x-admin-key` / company-less admin) | Company sub-admin |
+| --- | --- | --- |
+| `GET /api/roles` | every role | global roles + own company roles |
+| `POST /api/roles` | global role or any company role | own company only, `hierarchyLevel` **>** own |
+| `PUT /api/roles/:id` | any role | own company roles only, level stays **>** own |
+
+`MASTER`/`ADMIN`-style elevation is impossible for sub-admins: `ADMIN` sits at level `1`, so it is
+never greater than a sub-admin's own level. Role writes require the `ADMIN` role; unauthenticated
+requests get `401`, non-admin roles get `403`.
+
+### 5.1 `GET /api/roles`
 
 | Query parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | `includeInvalid` | boolean | `false` | Include rows with `is_valid = false` |
 
 ```bash
-curl http://localhost:3000/api/roles
+curl http://localhost:3000/api/roles -H "Authorization: Bearer $TOKEN"
 ```
 
-**Response — `200 OK`**
+**Response — `200 OK`** (company sub-admin of Acme)
 
 ```json
 {
-  "count": 2,
+  "count": 4,
   "data": [
-    { "id": 1, "role_name": "Administrator", "role_code": "ADMIN", "is_valid": true, "dt_entry_date": "2026-11-03T13:30:00.000Z" },
-    { "id": 2, "role_name": "Employee", "role_code": "EMPLOYEE", "is_valid": true, "dt_entry_date": "2026-11-03T13:30:00.000Z" }
+    { "id": 1, "role_name": "Administrator", "role_code": "ADMIN", "company_id": null, "hierarchy_level": 1, "is_valid": true, "dt_entry_date": "2026-11-03T13:30:00.000Z" },
+    { "id": 12, "role_name": "Supervisor", "role_code": "SUPERVISOR", "company_id": 3, "hierarchy_level": 50, "is_valid": true, "dt_entry_date": "2026-11-03T13:35:12.789Z" },
+    { "id": 13, "role_name": "Worker", "role_code": "WORKER", "company_id": 3, "hierarchy_level": 100, "is_valid": true, "dt_entry_date": "2026-11-03T13:35:20.101Z" },
+    { "id": 2, "role_name": "Employee", "role_code": "EMPLOYEE", "company_id": null, "hierarchy_level": 100, "is_valid": true, "dt_entry_date": "2026-11-03T13:30:00.000Z" }
   ]
 }
 ```
 
-### 4.2 `POST /api/roles` — requires `x-admin-key`
+Roles are ordered by `hierarchy_level` (higher authority first) and never include another
+company's roles.
+
+### 5.2 `POST /api/roles` — requires the `ADMIN` role
 
 | Body field | Type | Required | Constraint |
 | --- | --- | --- | --- |
 | `roleName` | string (≤100) | ✅ | must not be blank |
-| `roleCode` | string (≤50) | ✅ | **unique** (`uq_master_roles_role_code`); stored/compared uppercase |
+| `roleCode` | string (≤50) | ✅ | uppercase; **unique per company** (`uq_master_roles_company_code`) |
+| `companyId` | integer / null | No | `null` = global role (global actors only). Sub-admins: forced to own company |
+| `hierarchyLevel` | integer > 0 | No | default `100`; must be **greater than the caller's** level for sub-admins |
 
 ```bash
+# company sub-admin creating a subordinate role (company comes from the token)
+curl -X POST http://localhost:3000/api/roles \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"roleName":"Supervisor","roleCode":"SUPERVISOR","hierarchyLevel":50}'
+
+# platform administrator creating a global role
 curl -X POST http://localhost:3000/api/roles \
   -H 'Content-Type: application/json' \
   -H "x-admin-key: $ADMIN_API_KEY" \
-  -d '{"roleName":"Manager","roleCode":"MANAGER"}'
+  -d '{"roleName":"Auditor","roleCode":"AUDITOR","hierarchyLevel":5}'
 ```
 
 **Response — `201 Created`**
@@ -294,31 +442,36 @@ curl -X POST http://localhost:3000/api/roles \
 ```json
 {
   "data": {
-    "id": 3,
-    "role_name": "Manager",
-    "role_code": "MANAGER",
+    "id": 12,
+    "role_name": "Supervisor",
+    "role_code": "SUPERVISOR",
+    "company_id": 3,
+    "hierarchy_level": 50,
     "is_valid": true,
     "dt_entry_date": "2026-11-03T13:35:12.789Z"
   }
 }
 ```
 
-Errors: `401` invalid admin key · `503` role management disabled · `400` missing/blank value ·
-`409` duplicate `roleCode`.
+Errors: `400` missing/blank value, unknown company, invalid `hierarchyLevel` · `401` not authenticated ·
+`403` not an `ADMIN`, other company, or a level that is not subordinate · `409` duplicate code in that
+company.
 
-### 4.3 `PUT /api/roles/:id` — requires `x-admin-key`
+### 5.3 `PUT /api/roles/:id` — requires the `ADMIN` role
 
 | Body field | Type | Required | Constraint |
 | --- | --- | --- | --- |
 | `roleName` | string (≤100) | No | must not be blank |
-| `roleCode` | string (≤50) | No | unique |
+| `roleCode` | string (≤50) | No | unique per company |
+| `hierarchyLevel` | integer > 0 | No | sub-admins: must stay greater than their own level |
 | `isValid` | boolean | No | soft delete (users keep the role reference) |
+| `companyId` | – | ❌ | rejected with `400` — a role cannot move between companies |
 
 ```bash
-curl -X PUT http://localhost:3000/api/roles/3 \
+curl -X PUT http://localhost:3000/api/roles/12 \
   -H 'Content-Type: application/json' \
-  -H "x-admin-key: $ADMIN_API_KEY" \
-  -d '{"roleName":"Operations Manager"}'
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"roleName":"Shift Supervisor","hierarchyLevel":40}'
 ```
 
 **Response — `200 OK`** — `{ "data": { ...role... } }`
@@ -330,17 +483,28 @@ Errors: `401` invalid admin key · `503` disabled · `400` no updatable field ·
 > inserts missing codes, and `userModel.register()` depends on `EMPLOYEE` existing.
 
 
-## 5. Users
+## 6. Users
 
 A user row references three tables: `role_id` (required), `company_id` (optional) and `location_id`
 (optional, and only valid together with a company that owns that location). Passwords are hashed with
 bcrypt before insert; the hash is never returned by any endpoint.
 
-### 5.1 `GET /api/users`
+A user's **company** defines its tenancy: a user with `company_id` set is a company sub-admin/employee
+and, when logged in, only sees that company's data. Users without a company are global.
+
+**Who can do what**
+
+| Operation | Global actor | Company sub-admin |
+| --- | --- | --- |
+| `GET /api/users` | all users, optional filters | own company only (`403` if it asks for another) |
+| `POST /api/users` | any company, any role | own company only; role must be subordinate |
+| `PUT /api/users/:id` | any user | own company users, lower authority only |
+
+### 6.1 `GET /api/users`
 
 | Query parameter | Type | Default | Description |
 | --- | --- | --- | --- |
-| `companyId` | integer | – | Only users assigned to this company |
+| `companyId` | integer | – | Only users of this company (sub-admins: own company, others `403`) |
 | `locationId` | integer | – | Only users assigned to this location |
 | `includeInvalid` | boolean | `false` | Include users with `is_valid = false` |
 
@@ -371,32 +535,38 @@ curl 'http://localhost:3000/api/users?companyId=1&locationId=1'
 
 `role_code` comes from a join with `master_roles`; no `password` field is ever selected.
 
-### 5.2 `POST /api/users`
+### 6.2 `POST /api/users` — requires the `ADMIN` role
 
 | Body field | Type | Required | Constraint |
 | --- | --- | --- | --- |
 | `username` | string (3–100) | ✅ | **unique**, case-insensitive |
 | `password` | string (8–72) | ✅ | stored as bcrypt hash, never returned |
-| `roleCode` | string | No | default `EMPLOYEE`; any other value requires `x-admin-key` (**FK** → `master_roles.role_code`) |
-| `companyId` | integer / null | No | **FK** → `master_companies.id`; must exist and be `is_valid` |
+| `roleCode` | string | No | default `EMPLOYEE`; resolved in the target company scope (**FK** → `master_roles`) |
+| `companyId` | integer / null | No | **FK** → `master_companies.id`; sub-admins: forced to own company |
 | `locationId` | integer / null | No | **FK** → `companies_locations.id`; must belong to `companyId` and be `is_valid`; requires `companyId` |
 
+Role resolution: the company's own role with that code wins over the global one. A sub-admin can only
+assign roles whose `hierarchyLevel` is greater than its own, so `ADMIN` (level `1`) is refused with
+`403`.
+
 ```bash
-# default EMPLOYEE role (public registration path)
-curl -X POST http://localhost:3000/api/users \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"jdoe","password":"secret123"}'
-
-# with organizational assignment
-curl -X POST http://localhost:3000/api/users \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"asmith","password":"secret123","companyId":1,"locationId":1}'
-
-# privileged role — admin key required
+# platform administrator creating a company sub-admin
 curl -X POST http://localhost:3000/api/users \
   -H 'Content-Type: application/json' \
   -H "x-admin-key: $ADMIN_API_KEY" \
-  -d '{"username":"root","password":"secret123","roleCode":"ADMIN"}'
+  -d '{"username":"subadmin_acme","password":"secret123","roleCode":"ADMIN","companyId":3}'
+
+# company sub-admin creating a subordinate user (company comes from the token)
+curl -X POST http://localhost:3000/api/users \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"username":"supervisor1","password":"secret123","roleCode":"SUPERVISOR"}'
+
+# company sub-admin creating a worker at a location of its company
+curl -X POST http://localhost:3000/api/users \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"username":"worker1","password":"secret123","roleCode":"WORKER","locationId":11}'
 ```
 
 **Response — `201 Created`**
@@ -404,31 +574,34 @@ curl -X POST http://localhost:3000/api/users \
 ```json
 {
   "data": {
-    "id": 1,
-    "username": "jdoe",
-    "role_id": 2,
-    "company_id": null,
-    "location_id": null,
+    "id": 21,
+    "username": "worker1",
+    "role_id": 13,
+    "company_id": 3,
+    "location_id": 11,
     "is_valid": true,
     "dt_entry_date": "2026-11-03T13:40:00.000Z"
   }
 }
 ```
 
-Errors: `400` validation / unknown role / unknown company / location not in company /
-`locationId` without `companyId` · `401` ADMIN (or any non-EMPLOYEE) role without a valid admin key ·
-`409` username already taken (case-insensitive).
+Errors: `400` validation / unknown role in scope / unknown company / location not in company /
+`locationId` without `companyId` · `401` not authenticated · `403` not `ADMIN`, other company, or a role
+that is not subordinate to the caller · `409` username already taken (case-insensitive).
 
-### 5.3 `PUT /api/users/:id`
+### 6.3 `PUT /api/users/:id` — requires the `ADMIN` role
 
 | Body field | Type | Required | Constraint |
 | --- | --- | --- | --- |
 | `username` | string (3–100) | No | unique (case-insensitive) |
 | `password` | string (8–72) | No | re-hashed with bcrypt |
-| `roleCode` | string | No | existing, valid role; non-`EMPLOYEE` requires `x-admin-key` |
-| `companyId` | integer / null | No | must exist and be `is_valid` |
+| `roleCode` | string | No | existing role in the target company scope, must be subordinate to the caller |
+| `companyId` | integer / null | No | global actors only; sub-admins receive `403` |
 | `locationId` | integer / null | No | must belong to the effective company (after this update) |
 | `isValid` | boolean | No | soft delete / reactivate |
+
+Target user restrictions for sub-admins: the user must belong to their company and have a strictly
+lower authority (so a sub-admin cannot edit itself or a peer `ADMIN`).
 
 ```bash
 curl -X PUT http://localhost:3000/api/users/1 \
@@ -464,16 +637,21 @@ unknown role or company · `401` privileged role change without admin key · `40
 | `companyId` (locations, create) | `fk_companies_locations_company` | `master_companies.id` | model (pre-check within transaction) + DB | `400 Company {id} does not exist or is not valid.` |
 | `companyId` (users, create/update) | `fk_users_company` | `master_companies.id` | model (pre-check within transaction) + DB | `400 Company {id} does not exist or is not valid.` |
 | `locationId` (users) | `fk_users_location` | `companies_locations.id` | model checks id **and** that `company_id` matches + DB FK | `400 Location {id} does not belong to company {id} or is not valid.` |
-| `roleCode` (users) | `fk_users_role` | `master_roles.role_code` (resolved to `id`) | model lookup + DB FK | `400 Role "{code}" does not exist or is not valid.` |
+| `roleCode` (users) | `fk_users_role` | `master_roles` (code resolved within company scope) | model lookup + DB FK | `400 Role "{code}" does not exist for this company scope.` |
+| `companyId` (roles) | `fk_master_roles_company` | `master_companies.id` | model (pre-check within transaction) + DB | `400 Company {id} does not exist or is not valid.` |
 | `companyId` (locations, update) | – | – | model rule | `400 companyId cannot be changed; create a new location for the other company instead.` |
+| `companyId` (roles, update) | – | – | model rule | `400 companyId cannot be changed on an existing role.` |
 
 Database-level guarantees that back these up:
 
 - `users.location_id` is nullable, but `chk_users_location_requires_company` rejects a location
   without a company.
+- `master_roles.company_id` is nullable: `NULL` = global role, otherwise the owning company.
+  `chk_master_roles_hierarchy_level` rejects levels ≤ 0.
 - All foreign keys use `ON UPDATE CASCADE ON DELETE RESTRICT`: a company/role/location that is still
   referenced cannot be deleted.
-- Unique constraints: `master_companies.company_code`, `master_roles.role_code`,
+- Unique constraints: `master_companies.company_code`,
+  `master_roles (company_id, role_code)` with `NULLS NOT DISTINCT` (so global codes stay unique),
   `users.username` (+ `lower(username)`), `companies_locations (company_id, location_code)`.
 
 Practical implications when building clients:
@@ -482,8 +660,9 @@ Practical implications when building clients:
 2. Read ids from create responses (or `GET` lists) and send them as numbers.
 3. Deactivation is `isValid: false`; assignments referencing inactive rows are refused by the model
    layer even though the row still exists.
-4. Only `EMPLOYEE` can be self-assigned. Anything else needs the admin key, mirroring the rule that
-   roles are managed through backend-controlled functionality only.
+4. Log in as the company sub-admin and send `Authorization: Bearer <token>`; the company scope and
+   hierarchy are taken from the token, never from the request body.
+5. Cross-company access is rejected with `403`, not silently ignored.
 
 ## Status codes and errors
 
@@ -491,55 +670,78 @@ Practical implications when building clients:
 | --- | --- | --- |
 | `200` | Read/update succeeded | `{ "data": { ... } }` |
 | `201` | Record created | `{ "data": { ... } }` |
-| `400` | Validation or foreign-key/relationship violation | `{ "message": "locationId requires companyId." }` |
-| `401` | Missing/invalid `x-admin-key` for a privileged operation | `{ "message": "A valid x-admin-key header is required for this operation." }` |
+| `400` | Validation, foreign-key or relationship violation | `{ "message": "locationId requires companyId." }` |
+| `401` | Missing/invalid Bearer token or `x-admin-key`, wrong login credentials | `{ "message": "Invalid session token." }` |
+| `403` | Authenticated but not allowed (other company, role not subordinate, not `ADMIN`) | `{ "message": "You can only access users of your own company." }` |
 | `404` | Unknown id or route | `{ "message": "User 42 was not found." }` |
 | `409` | Unique constraint violation | `{ "message": "Username \"jdoe\" is already taken." }` |
 | `500` | Unexpected error (details only in server logs) | `{ "message": "Internal server error." }` |
-| `503` | Role management disabled (`ADMIN_API_KEY` not set) | `{ "message": "Role management is disabled. Set ADMIN_API_KEY in the environment to enable it." }` |
+| `503` | Login or admin-key features not configured | `{ "message": "Authentication is not configured. Set JWT_SECRET in the environment to enable login." }` |
 
 ## Local smoke test
 
 Identity ids increment and are not reset by deleting rows, so always use the `id` returned by the
-previous call instead of hard-coding `1`.
+previous call instead of hard-coding `1`. `ADMIN_API_KEY` and `JWT_SECRET` come from `.env.local`
+(see `.env.local.example`).
 
 ```bash
 # 1. start the API
 npm start
+export ADMIN_API_KEY=local-dev-admin-key   # value from .env.local
 
-# 2. create a company and capture its id (node is already required by the project)
+# 2. create a company (platform administrator) and capture its id
 COMPANY_ID=$(curl -s -X POST http://localhost:3000/api/companies \
   -H 'Content-Type: application/json' \
+  -H "x-admin-key: $ADMIN_API_KEY" \
   -d '{"companyName":"Acme Corp","companyCode":"ACME001"}' \
   | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).data.id')
 
 # 3. create a location for it (FK: companyId must exist and be valid)
 LOCATION_ID=$(curl -s -X POST http://localhost:3000/api/companies-locations \
   -H 'Content-Type: application/json' \
+  -H "x-admin-key: $ADMIN_API_KEY" \
   -d "{\"companyId\":$COMPANY_ID,\"locationName\":\"Head Office\",\"locationCode\":\"HO\"}" \
   | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).data.id')
 
-# 4. register a user (EMPLOYEE by default; location must belong to the company)
+# 4. create the company sub-admin (ADMIN role + company = scoped account)
 curl -s -X POST http://localhost:3000/api/users \
   -H 'Content-Type: application/json' \
-  -d "{\"username\":\"jdoe\",\"password\":\"secret123\",\"companyId\":$COMPANY_ID,\"locationId\":$LOCATION_ID}"
+  -H "x-admin-key: $ADMIN_API_KEY" \
+  -d "{\"username\":\"subadmin_acme\",\"password\":\"secret123\",\"roleCode\":\"ADMIN\",\"companyId\":$COMPANY_ID,\"locationId\":$LOCATION_ID}"
 
-# 5. list everything
-curl -s http://localhost:3000/api/companies
-curl -s http://localhost:3000/api/companies-locations
-curl -s http://localhost:3000/api/roles
-curl -s http://localhost:3000/api/users
+# 5. log in as the sub-admin
+TOKEN=$(curl -s -X POST http://localhost:3000/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"subadmin_acme","password":"secret123"}' \
+  | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).data.token')
+
+# 6. the token only ever sees this company
+curl -s http://localhost:3000/api/companies -H "Authorization: Bearer $TOKEN"
+curl -s http://localhost:3000/api/users -H "Authorization: Bearer $TOKEN"
+
+# 7. create subordinate roles for the company (SUPERVISOR -> WORKER)
+curl -s -X POST http://localhost:3000/api/roles \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"roleName":"Supervisor","roleCode":"SUPERVISOR","hierarchyLevel":50}'
+
+curl -s -X POST http://localhost:3000/api/roles \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"roleName":"Worker","roleCode":"WORKER","hierarchyLevel":100}'
+
+# 8. create users with those roles (company is taken from the token)
+curl -s -X POST http://localhost:3000/api/users \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"username":"supervisor1","password":"secret123","roleCode":"SUPERVISOR"}'
+
+# 9. public liveness endpoint
 curl -s http://localhost:3000/hello
 ```
 
-Set `ADMIN_API_KEY` in `.env.local` (see `.env.local.example`) to exercise role creation:
-
-```bash
-curl -s -X POST http://localhost:3000/api/roles \
-  -H 'Content-Type: application/json' \
-  -H "x-admin-key: $ADMIN_API_KEY" \
-  -d '{"roleName":"Manager","roleCode":"MANAGER"}'
-```
+Expected: the sub-admin's `GET /api/companies` returns exactly one company, `GET /api/users` only users
+of that company, and requesting another company's data answers `403`.
 
 Schema, constraints and the ER diagram: [DATABASE_DESIGN.md](DATABASE_DESIGN.md).
 Local setup commands: [LOCAL_SETUP.md](LOCAL_SETUP.md).

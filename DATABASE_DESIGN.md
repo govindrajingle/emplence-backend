@@ -41,6 +41,10 @@ source code or documentation; they live only in the git-ignored `.env` / `.env.l
 | `BCRYPT_SALT_ROUNDS` | No | `10` | bcrypt cost factor used by `userModel.register` |
 | `ENV_FILE` | No | – | Load one explicit env file instead of `.env.local` + `.env` |
 
+Authentication variables (`JWT_SECRET`, `AUTH_TOKEN_TTL_SECONDS`, `ADMIN_API_KEY`, `BCRYPT_SALT_ROUNDS`)
+are application-level and documented in [README.md](README.md#environment-variable-configuration);
+they do not change the database schema.
+
 ### SSL configuration
 
 - TLS is **on by default** (`DB_SSL_MODE=require`) with `rejectUnauthorized: true`; certificate
@@ -93,22 +97,27 @@ All four business tables share the same conventions:
 
 ### B.2 `master_roles`
 
-**Purpose:** roles available to application users. Managed exclusively by backend code — no public role-creation API exists.
+**Purpose:** roles available to application users. Roles are either **global** (`company_id IS NULL`,
+seeded: `ADMIN`, `EMPLOYEE`) or **owned by one company**, created by that company's sub-admin.
 
 | Column | Data type | Nullable | Default | Notes |
 | --- | --- | --- | --- | --- |
 | `id` | `BIGINT` | No | identity | Primary key |
-| `role_name` | `VARCHAR(100)` | No | – | Display name (`Administrator`, `Employee`) |
-| `role_code` | `VARCHAR(50)` | No | – | Unique, stable code (`ADMIN`, `EMPLOYEE`) used by code |
+| `role_name` | `VARCHAR(100)` | No | – | Display name (`Administrator`, `Supervisor`, ...) |
+| `role_code` | `VARCHAR(50)` | No | – | Stable code (`ADMIN`, `EMPLOYEE`, `SUPERVISOR`, ...) used by code |
+| `company_id` | `BIGINT` | **Yes** | – | `NULL` = global role; otherwise owning company (FK) |
+| `hierarchy_level` | `INTEGER` | No | `100` | Lower value = **more** authority; `ADMIN` = 1 |
 | `is_valid` | `BOOLEAN` | No | `TRUE` | Record validity |
 | `dt_entry_date` | `TIMESTAMP` | No | `CURRENT_TIMESTAMP` | Creation timestamp |
 
 - **Primary key:** `pk_master_roles (id)`
-- **Unique constraint:** `uq_master_roles_role_code (role_code)`
-- **Check constraints:** `chk_master_roles_role_name_not_blank`, `chk_master_roles_role_code_not_blank`
-- **Foreign keys:** none
+- **Unique constraint:** `uq_master_roles_company_code (company_id, role_code)` **NULLS NOT DISTINCT** — a code is unique within its company, and global codes stay unique among themselves (so two companies can both own a `SUPERVISOR` role)
+- **Foreign key:** `fk_master_roles_company (company_id)` → `master_companies (id)`, `ON UPDATE CASCADE ON DELETE RESTRICT`
+- **Check constraints:** `chk_master_roles_role_name_not_blank`, `chk_master_roles_role_code_not_blank`, `chk_master_roles_hierarchy_level (hierarchy_level > 0)`
+- **Indexes:** `idx_master_roles_company_id (company_id)`
 - **Referenced by:** `users.role_id` (NOT NULL)
-- **Seed data:** `Administrator`/`ADMIN` and `Employee`/`EMPLOYEE` (migration `005`, see section D)
+- **Seed data:** global `Administrator`/`ADMIN` (`hierarchy_level = 1`) and `Employee`/`EMPLOYEE` (`100`) — migration `005` + `006`, see section D
+- **Write access:** only through authenticated `ADMIN` actors — a company sub-admin is limited to its own company and to subordinate hierarchy levels
 
 
 ### B.3 `companies_locations`
@@ -141,7 +150,7 @@ All four business tables share the same conventions:
 | `id` | `BIGINT` | No | identity | Primary key |
 | `username` | `VARCHAR(100)` | No | – | Unique (also unique case-insensitively), must not be blank |
 | `password` | `VARCHAR(255)` | No | – | bcrypt hash — never plain text |
-| `role_id` | `BIGINT` | No | – | FK → `master_roles.id`; assigned by backend logic |
+| `role_id` | `BIGINT` | No | – | FK → `master_roles.id`; assigned by backend logic (`ADMIN` + `company_id` = company sub-admin) |
 | `company_id` | `BIGINT` | **Yes** | – | FK → `master_companies.id`; nullable while a user has no organization |
 | `location_id` | `BIGINT` | **Yes** | – | FK → `companies_locations.id`; requires `company_id` |
 | `is_valid` | `BOOLEAN` | No | `TRUE` | Record validity |
@@ -176,13 +185,15 @@ All relationships are **one-to-many** and are enforced by foreign keys with
 | --- | --- | --- | --- | --- | --- |
 | 1 | `master_companies` | `companies_locations` | `companies_locations.company_id` | 1 : N | A company has many branches/premises; every location needs an existing company |
 | 2 | `master_roles` | `users` | `users.role_id` (NOT NULL) | 1 : N | One role is assigned to many users; every user must have a role |
-| 3 | `master_companies` | `users` | `users.company_id` (nullable) | 1 : N | A company has many users; assignment may happen after registration |
+| 3 | `master_companies` | `users` | `users.company_id` (nullable) | 1 : N | A company has many users (sub-admins and staff); assignment may happen after registration |
 | 4 | `companies_locations` | `users` | `users.location_id` (nullable) | 1 : N | A location can host many users; requires `company_id` |
+| 5 | `master_companies` | `master_roles` | `master_roles.company_id` (nullable) | 1 : N | A company owns its own roles (e.g. `SUPERVISOR`); `NULL` marks a global role |
 
 ```mermaid
 erDiagram
     master_companies ||--o{ companies_locations : has
     master_companies ||--o{ users : employs
+    master_companies ||--o{ master_roles : owns
     master_roles ||--o{ users : assigned_to
     companies_locations ||--o{ users : assigned_to
 
@@ -197,7 +208,9 @@ erDiagram
     master_roles {
         bigint id PK
         varchar role_name
-        varchar role_code UK
+        varchar role_code
+        bigint company_id FK
+        integer hierarchy_level
         boolean is_valid
         timestamp dt_entry_date
     }
@@ -223,8 +236,8 @@ erDiagram
     }
 ```
 
-> `companies_locations.location_code` is unique **per company** (`company_id, location_code`), not
-> globally — see the unique constraint in section B.3.
+> `master_roles.role_code` is unique **per company** (`company_id, role_code`, `NULLS NOT DISTINCT`),
+> and `companies_locations.location_code` is unique per company as well — see sections B.2 and B.3.
 
 **Referential integrity split**
 
@@ -238,47 +251,71 @@ erDiagram
 
 ## D. Initial Master Data
 
-Two roles are created by the schema/seed process:
+Two **global** roles (`company_id IS NULL`) are created by the schema/seed process:
 
-| `role_name` | `role_code` | Meaning |
-| --- | --- | --- |
-| `Administrator` | `ADMIN` | Full administrative access; must never be granted through public registration |
-| `Employee` | `EMPLOYEE` | Default role for every self-registered user |
+| `role_name` | `role_code` | `hierarchy_level` | Scope | Meaning |
+| --- | --- | --- | --- | --- |
+| `Administrator` | `ADMIN` | `1` | global | Highest authority. Without a company it is the platform administrator; with a company it is that company's **sub-admin** |
+| `Employee` | `EMPLOYEE` | `100` | global | Default role for self-registered users and the lowest authority |
 
-`id` values are generated by the identity column, so never hard-code `1`/`2` in code — always
-resolve roles by `role_code`.
+`id` values are generated by the identity column, so never hard-code them in code — always resolve
+roles by `role_code` inside a company scope (`roleModel.findByCode(code, { companyId })`).
 
-### How the roles are created (triple safety, all idempotent)
+### How the global roles are created (triple safety, all idempotent)
 
-1. **Migration** `005_seed_master_roles.sql`:
+1. **Migration** `005_seed_master_roles.sql` (before role scoping existed):
    ```sql
    INSERT INTO master_roles (role_name, role_code)
    VALUES ('Administrator', 'ADMIN'), ('Employee', 'EMPLOYEE')
    ON CONFLICT (role_code) DO NOTHING;
    ```
-2. **Application startup** — `roleModel.ensureDefaultRoles()` runs on every boot with the same
-   `ON CONFLICT (role_code) DO NOTHING` insert, so a fresh or partially prepared database still ends
-   up with both roles, and repeated restarts never create duplicates (verified: the table keeps
-   exactly two rows).
+   `006_scope_roles_to_companies.sql` then adds `company_id`/`hierarchy_level` and sets `ADMIN` to
+   level `1` and `EMPLOYEE` to level `100`.
+2. **Application startup** — `roleModel.ensureDefaultRoles()` inserts the same two roles as global
+   roles with `ON CONFLICT (company_id, role_code) DO NOTHING`, so a fresh or partially prepared
+   database still ends up with both roles, and repeated restarts never create duplicates (verified:
+   exactly two global role rows remain).
 3. **Manual/CI seeding** — `npm run db:seed` calls the same model function.
 
-Because `role_code` carries a UNIQUE constraint, "duplicate on restart" is impossible at the database
-level as well.
+Because `(company_id, role_code)` is UNIQUE with `NULLS NOT DISTINCT`, "duplicate on restart" is
+impossible at the database level as well.
+
+### Company sub-admins and company roles
+
+Company staff are modelled without new tables:
+
+- A **sub-admin** is a user whose `role_id` points at `ADMIN` **and** whose `company_id` is set.
+  Login issues a token scoped to that company, so the sub-admin only ever sees that company's
+  locations, roles and users.
+- Sub-admins create **company roles** (`master_roles.company_id` = their company), for example
+  `SUPERVISOR` at level `50` and `WORKER` at level `100`. Another company may define its own
+  `SUPERVISOR` because uniqueness is per company.
+- Hierarchy rule: an actor may only create/assign roles whose `hierarchy_level` is **greater** than its
+  own. Since `ADMIN` is level `1`, a sub-admin can neither create a peer admin nor promote anyone to
+  `ADMIN`.
+
+Example (sub-admin of company 3, logged in with a company-scoped token):
+
+```sql
+INSERT INTO master_roles (role_name, role_code, company_id, hierarchy_level)
+VALUES ('Supervisor', 'SUPERVISOR', 3, 50),
+       ('Worker',     'WORKER',     3, 100);
+```
+
+The API performs exactly this insert through `POST /api/roles` after validating the token's company and
+hierarchy level.
 
 ### Adding more roles
 
-Roles are **backend-controlled only** — there is no public endpoint and no model method that creates
-roles. To introduce a new role:
+Roles are **never created through public endpoints** — writes require an authenticated `ADMIN` actor,
+and a company sub-admin is confined to its own company and subordinate levels. To add a **global** role
+in every environment:
 
-1. Add a migration (for example `006_add_manager_role.sql`) with
-   `INSERT INTO master_roles (role_name, role_code) VALUES ('Manager', 'MANAGER') ON CONFLICT (role_code) DO NOTHING;`
-2. Reference it in code by `role_code` (`roleModel.findByCode('MANAGER')`), never by numeric id.
-3. If the role must not be self-assignable, keep it out of `userModel.register()`, which always
-   resolves `EMPLOYEE` and does not accept a role argument.
+1. Add a migration (for example `007_add_auditor_role.sql`) with
+   `INSERT INTO master_roles (role_name, role_code, company_id, hierarchy_level) VALUES ('Auditor', 'AUDITOR', NULL, 5) ON CONFLICT (company_id, role_code) DO NOTHING;`
+2. Reference it in code by `role_code` + scope, never by numeric id.
+3. Keep it out of `userModel.register()`, which always resolves `EMPLOYEE` and accepts no role argument.
 4. Apply with `npm run db:migrate` and update this document.
-
-Because of `ON CONFLICT DO NOTHING` and the existing UNIQUE constraint, adding a role can be repeated
-safely in every environment.
 
 
 ## E. Future Database Changes

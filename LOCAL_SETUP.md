@@ -147,35 +147,48 @@ Or open <http://localhost:3000/hello> in a browser.
 
 Full payloads, examples and foreign-key rules: [RESTEndpoints.md](RESTEndpoints.md).
 Ids increment per insert, so use the `id` returned by each create call rather than hard-coding `1`.
+All `/api/*` routes need a credential: `x-admin-key: <ADMIN_API_KEY>` (platform admin) or
+`Authorization: Bearer <token>` from login.
 
 ```bash
-curl -s http://localhost:3000/api/companies
-curl -s http://localhost:3000/api/companies-locations?companyId=1
-curl -s http://localhost:3000/api/roles
-curl -s http://localhost:3000/api/users
-
-# create a company and capture its id
+# platform admin: create a company and capture its id
 COMPANY_ID=$(curl -s -X POST http://localhost:3000/api/companies \
   -H 'Content-Type: application/json' \
+  -H 'x-admin-key: local-dev-admin-key' \
   -d '{"companyName":"Acme Corp","companyCode":"ACME001"}' \
   | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).data.id')
 
-# create a location for that company (FK: companyId)
-LOCATION_ID=$(curl -s -X POST http://localhost:3000/api/companies-locations \
-  -H 'Content-Type: application/json' \
-  -d "{\"companyId\":$COMPANY_ID,\"locationName\":\"Head Office\",\"locationCode\":\"HO\"}" \
-  | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).data.id')
-
-# register a user (EMPLOYEE by default; location must belong to the company)
+# create a company sub-admin (ADMIN role + company = scoped account)
 curl -s -X POST http://localhost:3000/api/users \
   -H 'Content-Type: application/json' \
-  -d "{\"username\":\"jdoe\",\"password\":\"secret123\",\"companyId\":$COMPANY_ID,\"locationId\":$LOCATION_ID}"
+  -H 'x-admin-key: local-dev-admin-key' \
+  -d "{\"username\":\"subadmin_acme\",\"password\":\"secret123\",\"roleCode\":\"ADMIN\",\"companyId\":$COMPANY_ID}"
 
-# role management requires the admin key from .env.local (ADMIN_API_KEY)
+# log in as the sub-admin and keep the token
+TOKEN=$(curl -s -X POST http://localhost:3000/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"subadmin_acme","password":"secret123"}' \
+  | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).data.token')
+
+# scoped reads: only this company is visible
+curl -s http://localhost:3000/api/companies -H "Authorization: Bearer $TOKEN"
+curl -s http://localhost:3000/api/users -H "Authorization: Bearer $TOKEN"
+
+# sub-admin creates subordinate roles and users (company comes from the token)
 curl -s -X POST http://localhost:3000/api/roles \
   -H 'Content-Type: application/json' \
-  -H 'x-admin-key: local-dev-admin-key' \
-  -d '{"roleName":"Manager","roleCode":"MANAGER"}'
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"roleName":"Supervisor","roleCode":"SUPERVISOR","hierarchyLevel":50}'
+
+curl -s -X POST http://localhost:3000/api/roles \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"roleName":"Worker","roleCode":"WORKER","hierarchyLevel":100}'
+
+curl -s -X POST http://localhost:3000/api/users \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"username":"supervisor1","password":"secret123","roleCode":"SUPERVISOR"}'
 ```
 
 Without `x-admin-key`, `POST/PUT /api/roles` answers `401` (or `503` when `ADMIN_API_KEY` is unset),
@@ -311,6 +324,10 @@ DB_SSL_REJECT_UNAUTHORIZED=true
 | `[db] connection failed: database "default" does not exist` | Existing container lacks the DB. Use the compose service, or `docker exec -it <container> createdb -U <user> default`. |
 | `[db] master tables are missing` | Schema not created yet: run `npm run db:migrate` (then restart the API). |
 | `[seed] failed: relation "master_roles" does not exist` | Same cause: run `npm run db:migrate` before `npm run db:seed`. |
+| `401 Authentication required` / `Invalid session token` | Log in via `POST /api/auth/login` and send `Authorization: Bearer <token>`, or use `x-admin-key: <ADMIN_API_KEY>`. |
+| `503 Authentication is not configured` | `JWT_SECRET` is missing: add it to `.env.local` (see `.env.local.example`) and restart. |
+| `403 You can only access ... your own company` | Expected tenant isolation: log in as that company's sub-admin instead of requesting another company's data. |
+| `403 ... assign roles with a lower authority` | A sub-admin cannot grant `ADMIN` or a peer-level role; create a subordinate role first (`hierarchyLevel` greater than your own). |
 | `EADDRINUSE: address already in use :::3000` | `lsof -nP -iTCP:3000 -sTCP:LISTEN` then `pkill -f 'node src/server.js'`, or `PORT=3001 npm start`. |
 | `failed to connect to the docker API` / `Cannot connect to the Docker daemon` | Docker Desktop is not running: `open -a Docker`, then `docker info`. |
 | `port is already allocated` on `db:up` | Port 5433 is taken: `docker compose down`, or `LOCAL_DB_PORT=5440 docker compose up -d` (and update `DATABASE_URL`). |
