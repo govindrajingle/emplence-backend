@@ -1,6 +1,7 @@
 'use strict';
 
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 
 const PROJECT_ROOT = path.resolve(__dirname, '..');
@@ -24,7 +25,26 @@ const databaseModel = require('./models/databaseModel');
 
 const PORT = Number(process.env.PORT) || 3000;
 
+// Unset binds to all interfaces (also reachable from phones on the same Wi-Fi).
+// Set SERVER_HOST=127.0.0.1 to keep the API on this machine only.
+const SERVER_HOST = process.env.SERVER_HOST;
+
 let server;
+
+/** IPv4 addresses of this machine, used to log phone-accessible URLs. */
+const getLanUrls = (port) => {
+  const urls = [];
+
+  for (const addresses of Object.values(os.networkInterfaces())) {
+    for (const address of addresses ?? []) {
+      if (address.family === 'IPv4' && !address.internal) {
+        urls.push(`http://${address.address}:${port}`);
+      }
+    }
+  }
+
+  return urls;
+};
 
 /**
  * Verifies PostgreSQL connectivity before exposing the API, so a broken
@@ -71,8 +91,20 @@ const start = async () => {
 
   await connectDatabase();
 
-  server = app.listen(PORT, () => {
-    console.log(`[server] listening on http://localhost:${PORT}`);
+  const listenOptions = { port: PORT };
+  if (SERVER_HOST) {
+    listenOptions.host = SERVER_HOST;
+  }
+
+  server = app.listen(listenOptions, () => {
+    console.log(`[server] listening on http://localhost:${PORT} (bind: ${SERVER_HOST || 'all interfaces'})`);
+
+    if (!SERVER_HOST || SERVER_HOST === '0.0.0.0' || SERVER_HOST === '::') {
+      const lanUrls = getLanUrls(PORT);
+      if (lanUrls.length > 0) {
+        console.log(`[server] reachable on your network: ${lanUrls.join(', ')}`);
+      }
+    }
   });
 
   server.on('error', (error) => {
