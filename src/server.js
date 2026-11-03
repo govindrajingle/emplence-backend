@@ -9,6 +9,7 @@ const { loadedEnvFiles } = require('./config/env');
 const app = require('./app');
 const { closePool, getSslSummary } = require('./config/db');
 const databaseModel = require('./models/databaseModel');
+const roleModel = require('./models/roleModel');
 
 const PORT = Number(process.env.PORT) || 3000;
 
@@ -69,6 +70,26 @@ const connectDatabase = async () => {
   }
 };
 
+/** Seeds the master data the app depends on. Safe on every start (no duplicates). */
+const initializeMasterData = async () => {
+  try {
+    const { inserted } = await roleModel.ensureDefaultRoles();
+    console.log(
+      inserted.length > 0
+        ? `[db] default roles seeded: ${inserted.join(', ')}`
+        : '[db] default roles already present',
+    );
+  } catch (error) {
+    // 42P01 = undefined_table: schema not migrated yet. Keep the API usable and explain.
+    if (error.code === '42P01') {
+      console.warn('[db] master tables are missing - run `npm run db:migrate` to create the schema.');
+      return;
+    }
+
+    throw error;
+  }
+};
+
 const start = async () => {
   console.log(
     loadedEnvFiles.length > 0
@@ -77,6 +98,14 @@ const start = async () => {
   );
 
   await connectDatabase();
+
+  try {
+    await initializeMasterData();
+  } catch (error) {
+    console.error(`[db] master data initialization failed: ${error.message}`);
+    await closePool();
+    process.exit(1);
+  }
 
   const listenOptions = { port: PORT };
   if (SERVER_HOST) {
