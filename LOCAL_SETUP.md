@@ -146,6 +146,7 @@ Or open <http://localhost:3000/hello> in a browser.
 ## 7b. REST endpoints overview
 
 Full payloads, examples and foreign-key rules: [RESTEndpoints.md](RESTEndpoints.md).
+Ids increment per insert, so use the `id` returned by each create call rather than hard-coding `1`.
 
 ```bash
 curl -s http://localhost:3000/api/companies
@@ -153,18 +154,22 @@ curl -s http://localhost:3000/api/companies-locations?companyId=1
 curl -s http://localhost:3000/api/roles
 curl -s http://localhost:3000/api/users
 
-# create a company, then a location for it, then a user
-curl -s -X POST http://localhost:3000/api/companies \
+# create a company and capture its id
+COMPANY_ID=$(curl -s -X POST http://localhost:3000/api/companies \
   -H 'Content-Type: application/json' \
-  -d '{"companyName":"Acme Corp","companyCode":"ACME001"}'
+  -d '{"companyName":"Acme Corp","companyCode":"ACME001"}' \
+  | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).data.id')
 
-curl -s -X POST http://localhost:3000/api/companies-locations \
+# create a location for that company (FK: companyId)
+LOCATION_ID=$(curl -s -X POST http://localhost:3000/api/companies-locations \
   -H 'Content-Type: application/json' \
-  -d '{"companyId":1,"locationName":"Head Office","locationCode":"HO"}'
+  -d "{\"companyId\":$COMPANY_ID,\"locationName\":\"Head Office\",\"locationCode\":\"HO\"}" \
+  | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).data.id')
 
+# register a user (EMPLOYEE by default; location must belong to the company)
 curl -s -X POST http://localhost:3000/api/users \
   -H 'Content-Type: application/json' \
-  -d '{"username":"jdoe","password":"secret123","companyId":1,"locationId":1}'
+  -d "{\"username\":\"jdoe\",\"password\":\"secret123\",\"companyId\":$COMPANY_ID,\"locationId\":$LOCATION_ID}"
 
 # role management requires the admin key from .env.local (ADMIN_API_KEY)
 curl -s -X POST http://localhost:3000/api/roles \

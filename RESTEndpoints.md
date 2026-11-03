@@ -500,24 +500,29 @@ Practical implications when building clients:
 
 ## Local smoke test
 
+Identity ids increment and are not reset by deleting rows, so always use the `id` returned by the
+previous call instead of hard-coding `1`.
+
 ```bash
 # 1. start the API
 npm start
 
-# 2. create a company
-COMPANY=$(curl -s -X POST http://localhost:3000/api/companies \
+# 2. create a company and capture its id (node is already required by the project)
+COMPANY_ID=$(curl -s -X POST http://localhost:3000/api/companies \
   -H 'Content-Type: application/json' \
-  -d '{"companyName":"Acme Corp","companyCode":"ACME001"}')
+  -d '{"companyName":"Acme Corp","companyCode":"ACME001"}' \
+  | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).data.id')
 
-# 3. create a location for it
-curl -s -X POST http://localhost:3000/api/companies-locations \
+# 3. create a location for it (FK: companyId must exist and be valid)
+LOCATION_ID=$(curl -s -X POST http://localhost:3000/api/companies-locations \
   -H 'Content-Type: application/json' \
-  -d '{"companyId":1,"locationName":"Head Office","locationCode":"HO"}'
+  -d "{\"companyId\":$COMPANY_ID,\"locationName\":\"Head Office\",\"locationCode\":\"HO\"}" \
+  | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).data.id')
 
-# 4. register a user (EMPLOYEE by default)
+# 4. register a user (EMPLOYEE by default; location must belong to the company)
 curl -s -X POST http://localhost:3000/api/users \
   -H 'Content-Type: application/json' \
-  -d '{"username":"jdoe","password":"secret123","companyId":1,"locationId":1}'
+  -d "{\"username\":\"jdoe\",\"password\":\"secret123\",\"companyId\":$COMPANY_ID,\"locationId\":$LOCATION_ID}"
 
 # 5. list everything
 curl -s http://localhost:3000/api/companies
