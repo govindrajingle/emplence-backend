@@ -38,7 +38,11 @@ emplence-backend/
 │   │   ├── env.js                  # Loads .env.local then .env (or ENV_FILE)
 │   │   └── db.js                   # PostgreSQL pool, TLS/SSL config, withTransaction()
 │   ├── controllers/
-│   │   └── helloController.js      # Handles GET /hello
+│   │   ├── helloController.js      # GET /hello
+│   │   ├── companyController.js    # /api/companies
+│   │   ├── locationController.js   # /api/companies-locations
+│   │   ├── roleController.js       # /api/roles
+│   │   └── userController.js       # /api/users
 │   ├── database/
 │   │   ├── migrate.js              # Migration runner (tracks schema_migrations)
 │   │   ├── seed.js                 # Idempotent default-role seeding
@@ -48,6 +52,8 @@ emplence-backend/
 │   │       ├── 003_create_companies_locations.sql
 │   │       ├── 004_create_users.sql
 │   │       └── 005_seed_master_roles.sql
+│   ├── middleware/
+│   │   └── adminKey.js             # x-admin-key guard for role management
 │   ├── models/
 │   │   ├── companyModel.js         # master_companies
 │   │   ├── roleModel.js            # master_roles (+ ensureDefaultRoles)
@@ -55,13 +61,19 @@ emplence-backend/
 │   │   ├── userModel.js            # users (bcrypt hashing, EMPLOYEE role)
 │   │   └── databaseModel.js        # startup connection ping
 │   ├── routes/
-│   │   ├── index.js                # Route table
-│   │   └── helloRoutes.js          # /hello routes
+│   │   ├── index.js                # Mounts /hello and /api/*
+│   │   ├── helloRoutes.js          # /hello
+│   │   ├── companyRoutes.js        # /api/companies
+│   │   ├── locationRoutes.js       # /api/companies-locations
+│   │   ├── roleRoutes.js           # /api/roles
+│   │   └── userRoutes.js           # /api/users
 │   ├── utils/
-│   │   └── errors.js               # HTTP-aware app errors + PostgreSQL error mapping
+│   │   ├── errors.js               # HTTP-aware app errors + PostgreSQL error mapping
+│   │   └── validation.js           # Shared id/text/boolean validators
 │   └── views/                      # Reserved; responses are JSON (no templates needed)
 ├── docker-compose.yml              # Local PostgreSQL 18 container (development only)
 ├── DATABASE_DESIGN.md              # Schema, relationships, ER diagram, migration policy
+├── RESTEndpoints.md                # Full REST API reference (all endpoints)
 ├── LOCAL_SETUP.md                  # Step-by-step local Docker command reference
 ├── .env.example                    # Production/hosted template (TLS required)
 ├── .env.local.example              # Local Docker template (TLS disabled)
@@ -135,6 +147,7 @@ All credentials come from env files (never hardcoded, never committed).
 | `DB_CONNECT_TIMEOUT_MS`      | No       | `10000`   | Connection attempt timeout in milliseconds.                                 |
 | `SERVER_HOST`                | No       | all interfaces | Bind address; `127.0.0.1` limits access to this machine.              |
 | `BCRYPT_SALT_ROUNDS`         | No       | `10`      | bcrypt cost factor used when hashing user passwords.                        |
+| `ADMIN_API_KEY`              | No       | –         | Shared key for `x-admin-key`; unset disables role management (503).         |
 | `ENV_FILE`                   | No       | –         | Load one explicit env file instead of `.env.local` + `.env`.                |
 
 Example `.env.local` (local Docker, no TLS):
@@ -313,6 +326,29 @@ Implementation notes:
   of truth. Keeping `?sslmode=require` in the URI is therefore harmless and optional.
 
 ## Available REST API Endpoints
+
+All endpoints are documented in **[RESTEndpoints.md](RESTEndpoints.md)** with payloads, curl examples
+and foreign-key behaviour. Summary:
+
+| Method | Endpoint | Purpose | Auth |
+| --- | --- | --- | --- |
+| `GET` | `/hello` | Liveness check (original endpoint) | – |
+| `GET` | `/api/companies` | List companies (`?includeInvalid=true`) | – |
+| `POST` | `/api/companies` | Create a company | – |
+| `PUT` | `/api/companies/:id` | Update a company | – |
+| `GET` | `/api/companies-locations` | List locations (`?companyId=&includeInvalid=`) | – |
+| `POST` | `/api/companies-locations` | Create a location for a company | – |
+| `PUT` | `/api/companies-locations/:id` | Update a location (`companyId` immutable) | – |
+| `GET` | `/api/roles` | List roles | – |
+| `POST` | `/api/roles` | Create a role | `x-admin-key` |
+| `PUT` | `/api/roles/:id` | Update a role | `x-admin-key` |
+| `GET` | `/api/users` | List users (`?companyId=&locationId=&includeInvalid=`) | – |
+| `POST` | `/api/users` | Create a user (role defaults to `EMPLOYEE`) | `x-admin-key` for non-`EMPLOYEE` roles |
+| `PUT` | `/api/users/:id` | Update a user | `x-admin-key` for privileged role changes |
+
+> Roles stay backend-controlled: `POST/PUT /api/roles` (and assigning a non-`EMPLOYEE` role to a user)
+> require the `x-admin-key` header whose value is `ADMIN_API_KEY`. Without that variable the role
+> write endpoints return `503`.
 
 ### `GET /hello`
 

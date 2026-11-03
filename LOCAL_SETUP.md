@@ -143,6 +143,39 @@ curl http://localhost:3000/does-not-exist   # 404 JSON: {"message":"Route GET /d
 
 Or open <http://localhost:3000/hello> in a browser.
 
+## 7b. REST endpoints overview
+
+Full payloads, examples and foreign-key rules: [RESTEndpoints.md](RESTEndpoints.md).
+
+```bash
+curl -s http://localhost:3000/api/companies
+curl -s http://localhost:3000/api/companies-locations?companyId=1
+curl -s http://localhost:3000/api/roles
+curl -s http://localhost:3000/api/users
+
+# create a company, then a location for it, then a user
+curl -s -X POST http://localhost:3000/api/companies \
+  -H 'Content-Type: application/json' \
+  -d '{"companyName":"Acme Corp","companyCode":"ACME001"}'
+
+curl -s -X POST http://localhost:3000/api/companies-locations \
+  -H 'Content-Type: application/json' \
+  -d '{"companyId":1,"locationName":"Head Office","locationCode":"HO"}'
+
+curl -s -X POST http://localhost:3000/api/users \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"jdoe","password":"secret123","companyId":1,"locationId":1}'
+
+# role management requires the admin key from .env.local (ADMIN_API_KEY)
+curl -s -X POST http://localhost:3000/api/roles \
+  -H 'Content-Type: application/json' \
+  -H 'x-admin-key: local-dev-admin-key' \
+  -d '{"roleName":"Manager","roleCode":"MANAGER"}'
+```
+
+Without `x-admin-key`, `POST/PUT /api/roles` answers `401` (or `503` when `ADMIN_API_KEY` is unset),
+and assigning a non-`EMPLOYEE` role to a user is rejected the same way.
+
 ## 8. Inspect the database
 
 ```bash
