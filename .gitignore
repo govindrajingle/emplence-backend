@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Environment / secrets (never commit real credentials)
+.env
+.env.*
+!.env.example
+
+# Certificates (provider CA bundles, client certs)
+certs/
+*.pem
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Coverage output
+coverage/

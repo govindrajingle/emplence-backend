@@ -1,0 +1,32 @@
+{
+  "name": "emplence-backend",
+  "version": "1.0.0",
+  "description": "Minimal Node.js MVC backend with a PostgreSQL 18 connection and a GET /hello REST endpoint",
+  "main": "src/server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/govindrajingle/emplence-backend.git"
+  },
+  "keywords": [
+    "nodejs",
+    "express",
+    "postgresql",
+    "mvc",
+    "rest-api"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^18.0.9",
+    "express": "^5.3.0",
+    "pg": "^8.23.1"
+  }
+}
