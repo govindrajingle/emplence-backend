@@ -5,6 +5,7 @@ const bcrypt = require('bcryptjs');
 const { getPool, withTransaction } = require('../config/db');
 const { createAppError, mapDatabaseError } = require('../utils/errors');
 const { hasOwn, parseBoolean, parseId } = require('../utils/validation');
+const roleModel = require('./roleModel');
 
 /**
  * Model for `users`.
@@ -74,34 +75,31 @@ const validateCredentials = ({ username, password }) => {
   return name;
 };
 
-/** Resolves a role id by code inside an open transaction. */
-const resolveRoleId = async (client, roleCode) => {
-  const code =
-    typeof roleCode === 'string' && roleCode.trim()
-      ? roleCode.trim().toUpperCase()
-      : PUBLIC_REGISTRATION_ROLE_CODE;
+/** Ensures a role id exists and is valid inside an open transaction. */
+const assertRoleExists = async (client, roleId) => {
+  const id = parseId(roleId, 'roleId');
 
   const { rows } = await client.query(
-    'SELECT id FROM master_roles WHERE role_code = $1 AND is_valid = TRUE',
-    [code],
+    'SELECT id FROM master_roles WHERE id = $1 AND is_valid = TRUE',
+    [id],
   );
 
   if (rows.length === 0) {
-    throw createAppError(400, `Role "${code}" does not exist or is not valid.`);
+    throw createAppError(400, `Role ${id} does not exist or is not valid.`);
   }
 
-  return rows[0].id;
+  return id;
 };
 
 /**
  * Creates a user with a hashed password.
  *
- * `roleCode` defaults to EMPLOYEE. Assigning any other role is privileged and
- * the HTTP layer requires the ADMIN_API_KEY header for it.
+ * `roleId` is required and must already be authorised by the controller
+ * (role scope + hierarchy are enforced in the HTTP layer).
  * Company/location are optional, but a location is only accepted when it
  * belongs to the supplied company.
  */
-const create = async ({ username, password, roleCode, companyId, locationId }) => {
+const create = async ({ username, password, roleId, companyId, locationId }) => {
   const name = validateCredentials({ username, password });
   const company = parseOptionalId(companyId, 'companyId');
   const location = parseOptionalId(locationId, 'locationId');
@@ -115,7 +113,7 @@ const create = async ({ username, password, roleCode, companyId, locationId }) =
 
   try {
     return await withTransaction(async (client) => {
-      const roleId = await resolveRoleId(client, roleCode);
+      const resolvedRoleId = await assertRoleExists(client, roleId);
 
       if (company !== null) {
         const companyRow = await client.query(
@@ -148,7 +146,7 @@ const create = async ({ username, password, roleCode, companyId, locationId }) =
         `INSERT INTO users (username, password, role_id, company_id, location_id)
          VALUES ($1, $2, $3, $4, $5)
          RETURNING ${USER_COLUMNS}`,
-        [name, passwordHash, roleId, company, location],
+        [name, passwordHash, resolvedRoleId, company, location],
       );
 
       return rows[0];
@@ -164,14 +162,18 @@ const create = async ({ username, password, roleCode, companyId, locationId }) =
  * Public self-registration: the role is always EMPLOYEE and cannot be supplied
  * by the caller, so nobody can grant themselves ADMIN.
  */
-const register = async ({ username, password, companyId, locationId }) =>
-  create({
-    username,
-    password,
-    roleCode: PUBLIC_REGISTRATION_ROLE_CODE,
-    companyId,
-    locationId,
-  });
+const register = async ({ username, password, companyId, locationId }) => {
+  const role = await roleModel.findByCode(PUBLIC_REGISTRATION_ROLE_CODE, { companyId: null });
+
+  if (!role) {
+    throw createAppError(
+      500,
+      `Default role "${PUBLIC_REGISTRATION_ROLE_CODE}" is missing; run \`npm run db:seed\`.`,
+    );
+  }
+
+  return create({ username, password, roleId: role.id, companyId, locationId });
+};
 
 /** Case-insensitive lookup without exposing the password hash. */
 const findByUsername = async (username) => {
@@ -194,9 +196,37 @@ const findByUsername = async (username) => {
 const findById = async (id) => {
   const userId = parseId(id, 'userId');
 
-  const { rows } = await getPool().query(`SELECT ${USER_COLUMNS} FROM users WHERE id = $1`, [
-    userId,
-  ]);
+  const { rows } = await getPool().query(
+    `SELECT u.id, u.username, u.role_id, r.role_code, r.hierarchy_level, r.company_id AS role_company_id,
+            u.company_id, u.location_id, u.is_valid, u.dt_entry_date
+       FROM users u
+       JOIN master_roles r ON r.id = u.role_id
+      WHERE u.id = $1`,
+    [userId],
+  );
+
+  return rows[0] ?? null;
+};
+
+/**
+ * Credentials for login: includes the password hash plus role scope/hierarchy.
+ * Never expose the result of this function over HTTP.
+ */
+const findCredentialsByUsername = async (username) => {
+  const name = typeof username === 'string' ? username.trim() : '';
+
+  if (!name) {
+    throw createAppError(400, 'username is required.');
+  }
+
+  const { rows } = await getPool().query(
+    `SELECT u.id, u.username, u.password, u.company_id, u.is_valid,
+            r.id AS role_id, r.role_code, r.hierarchy_level
+       FROM users u
+       JOIN master_roles r ON r.id = u.role_id
+      WHERE lower(u.username) = lower($1)`,
+    [name],
+  );
 
   return rows[0] ?? null;
 };
@@ -276,8 +306,8 @@ const update = async (id, changes = {}) => {
       if (hasOwn(changes, 'isValid')) {
         set('is_valid', parseBoolean(changes.isValid, 'isValid'));
       }
-      if (hasOwn(changes, 'roleCode')) {
-        set('role_id', await resolveRoleId(client, changes.roleCode));
+      if (hasOwn(changes, 'roleId')) {
+        set('role_id', await assertRoleExists(client, changes.roleId));
       }
 
       const companyProvided = hasOwn(changes, 'companyId');
@@ -359,6 +389,7 @@ module.exports = {
   create,
   register,
   findByUsername,
+  findCredentialsByUsername,
   findById,
   findAll,
   update,
