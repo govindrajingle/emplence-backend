@@ -11,6 +11,7 @@ Shell: macOS/Linux (`zsh`/`bash`).
 npm install
 npm run db:up
 cp .env.local.example .env.local
+npm run db:migrate
 npm start
 # in a second terminal:
 curl http://localhost:3000/hello
@@ -167,12 +168,28 @@ npm start               # start the API
 npm run dev             # start the API with auto-reload
 npm run db:up           # start the database (idempotent)
 npm run db:down         # stop the database, keep its data
+npm run db:migrate      # apply pending SQL migrations (safe to re-run)
+npm run db:seed         # ensure default roles ADMIN / EMPLOYEE exist
 docker compose ps       # container status
 docker compose logs -f postgres
 curl http://localhost:3000/hello
 ```
 
 Stop the API with `Ctrl+C`; stop the database with `npm run db:down`.
+
+## 9b. Database schema and migrations
+
+```bash
+npm run db:migrate                                  # apply migrations 001..005
+docker exec emplence-postgres18 psql -U emplence -d default -c '\dt'
+docker exec emplence-postgres18 psql -U emplence -d default -c 'select id, role_name, role_code from master_roles order by id;'
+docker exec emplence-postgres18 psql -U emplence -d default -c 'select name, applied_at from schema_migrations order by name;'
+```
+
+Expected tables: `master_companies`, `master_roles`, `companies_locations`, `users`, plus
+`schema_migrations` (bookkeeping). Expected roles: exactly two rows — `ADMIN` and `EMPLOYEE`.
+Startup logs `[db] default roles already present` after the first run, which proves the seeding is
+idempotent. Schema details: [DATABASE_DESIGN.md](DATABASE_DESIGN.md).
 
 ## 10. Stop and reset
 
@@ -254,6 +271,8 @@ DB_SSL_REJECT_UNAUTHORIZED=true
 | `[db] connection failed: connect ECONNREFUSED 127.0.0.1:5433` | Database not running or wrong port: `npm run db:up`, then `docker compose ps`. |
 | `[db] connection failed: password authentication failed` | Credentials in `.env.local` do not match the container: use `emplence` / `emplence`, or reset with `docker compose down -v && npm run db:up`. |
 | `[db] connection failed: database "default" does not exist` | Existing container lacks the DB. Use the compose service, or `docker exec -it <container> createdb -U <user> default`. |
+| `[db] master tables are missing` | Schema not created yet: run `npm run db:migrate` (then restart the API). |
+| `[seed] failed: relation "master_roles" does not exist` | Same cause: run `npm run db:migrate` before `npm run db:seed`. |
 | `EADDRINUSE: address already in use :::3000` | `lsof -nP -iTCP:3000 -sTCP:LISTEN` then `pkill -f 'node src/server.js'`, or `PORT=3001 npm start`. |
 | `failed to connect to the docker API` / `Cannot connect to the Docker daemon` | Docker Desktop is not running: `open -a Docker`, then `docker info`. |
 | `port is already allocated` on `db:up` | Port 5433 is taken: `docker compose down`, or `LOCAL_DB_PORT=5440 docker compose up -d` (and update `DATABASE_URL`). |

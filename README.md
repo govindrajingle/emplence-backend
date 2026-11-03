@@ -15,15 +15,17 @@ This service is intentionally small and focused:
 
 ## Technology Stack
 
-| Concern        | Choice                                        |
-| -------------- | --------------------------------------------- |
-| Runtime        | Node.js 18+ (verified on Node.js 24)          |
-| Language       | JavaScript (CommonJS)                         |
-| Framework      | Express 5                                     |
-| Database       | PostgreSQL 18 (`pg` driver, connection pool)  |
-| Configuration  | `dotenv` (environment variables)              |
-| Architecture   | MVC (Model-View-Controller)                   |
-| API style      | RESTful JSON API                              |
+| Concern        | Choice                                             |
+| -------------- | -------------------------------------------------- |
+| Runtime        | Node.js 18+ (verified on Node.js 24)               |
+| Language       | JavaScript (CommonJS)                              |
+| Framework      | Express 5                                          |
+| Database       | PostgreSQL 18 (`pg` driver, connection pool)       |
+| Migrations     | Plain SQL files + `npm run db:migrate` runner       |
+| Password hash  | `bcryptjs` (bcrypt algorithm, cost 10 by default)   |
+| Configuration  | `dotenv` (environment variables)                   |
+| Architecture   | MVC (Model-View-Controller)                        |
+| API style      | RESTful JSON API                                   |
 
 ## Project Folder Structure
 
@@ -31,18 +33,35 @@ This service is intentionally small and focused:
 emplence-backend/
 ├── src/
 │   ├── app.js                      # Express app: middleware, routes, 404 + error handlers
-│   ├── server.js                   # Bootstrap: loads env files, checks DB, starts HTTP server
+│   ├── server.js                   # Bootstrap: env, DB check, role seeding, HTTP server
 │   ├── config/
-│   │   └── db.js                   # PostgreSQL pool + TLS/SSL configuration
+│   │   ├── env.js                  # Loads .env.local then .env (or ENV_FILE)
+│   │   └── db.js                   # PostgreSQL pool, TLS/SSL config, withTransaction()
 │   ├── controllers/
 │   │   └── helloController.js      # Handles GET /hello
+│   ├── database/
+│   │   ├── migrate.js              # Migration runner (tracks schema_migrations)
+│   │   ├── seed.js                 # Idempotent default-role seeding
+│   │   └── migrations/
+│   │       ├── 001_create_master_companies.sql
+│   │       ├── 002_create_master_roles.sql
+│   │       ├── 003_create_companies_locations.sql
+│   │       ├── 004_create_users.sql
+│   │       └── 005_seed_master_roles.sql
 │   ├── models/
-│   │   └── databaseModel.js        # Only layer that queries PostgreSQL (startup ping)
+│   │   ├── companyModel.js         # master_companies
+│   │   ├── roleModel.js            # master_roles (+ ensureDefaultRoles)
+│   │   ├── companyLocationModel.js # companies_locations
+│   │   ├── userModel.js            # users (bcrypt hashing, EMPLOYEE role)
+│   │   └── databaseModel.js        # startup connection ping
 │   ├── routes/
 │   │   ├── index.js                # Route table
 │   │   └── helloRoutes.js          # /hello routes
+│   ├── utils/
+│   │   └── errors.js               # HTTP-aware app errors + PostgreSQL error mapping
 │   └── views/                      # Reserved; responses are JSON (no templates needed)
 ├── docker-compose.yml              # Local PostgreSQL 18 container (development only)
+├── DATABASE_DESIGN.md              # Schema, relationships, ER diagram, migration policy
 ├── LOCAL_SETUP.md                  # Step-by-step local Docker command reference
 ├── .env.example                    # Production/hosted template (TLS required)
 ├── .env.local.example              # Local Docker template (TLS disabled)
@@ -55,7 +74,7 @@ emplence-backend/
 
 - `routes` only declare URL → controller mappings.
 - `controllers` build the HTTP response and never import the database directly.
-- `models` own all SQL/database access.
+- `models` own all SQL/database access (parameterized queries, transactions, FK validation).
 - `config` owns connection/SSL settings read from environment variables.
 
 ## Prerequisites
@@ -76,9 +95,12 @@ cp .env.local.example .env.local
 
 # 2b. OR production/hosted database (TLS required)
 cp .env.example .env     # then paste your real service URI into DATABASE_URL
+
+# 3. Create/upgrade the database schema (idempotent, safe to re-run)
+npm run db:migrate
 ```
 
-`npm install` installs the only three runtime dependencies: `express`, `pg`, and `dotenv`.
+`npm install` installs the runtime dependencies: `express`, `pg`, `dotenv`, `bcryptjs`.
 
 ## Environment Files (local vs production)
 
@@ -112,6 +134,7 @@ All credentials come from env files (never hardcoded, never committed).
 | `DB_SSL_CA_PATH`             | No       | –         | Path to a provider CA bundle file (PEM).                                    |
 | `DB_CONNECT_TIMEOUT_MS`      | No       | `10000`   | Connection attempt timeout in milliseconds.                                 |
 | `SERVER_HOST`                | No       | all interfaces | Bind address; `127.0.0.1` limits access to this machine.              |
+| `BCRYPT_SALT_ROUNDS`         | No       | `10`      | bcrypt cost factor used when hashing user passwords.                        |
 | `ENV_FILE`                   | No       | –         | Load one explicit env file instead of `.env.local` + `.env`.                |
 
 Example `.env.local` (local Docker, no TLS):
@@ -232,6 +255,39 @@ Full troubleshooting: [LOCAL_SETUP.md §16](LOCAL_SETUP.md#16-access-hello-from-
 
 Pool settings: max 10 clients, 30 s idle timeout, `DB_CONNECT_TIMEOUT_MS` connect timeout,
 and an idle-client error listener that prevents unexpected crashes.
+## Database Schema
+
+Schema is versioned in `src/database/migrations/` and applied with `npm run db:migrate`
+(recorded in the `schema_migrations` table, so re-running is a no-op).
+
+| Table | Purpose | Key constraints |
+| --- | --- | --- |
+| `master_companies` | Registered companies (root table) | PK `id`, UNIQUE `company_code` |
+| `master_roles` | Available user roles (`ADMIN`, `EMPLOYEE`) | PK `id`, UNIQUE `role_code` |
+| `companies_locations` | Branches/offices of a company | PK `id`, FK `company_id` → `master_companies`, UNIQUE (`company_id`, `location_code`) |
+| `users` | Accounts with hashed passwords + assignment | PK `id`, UNIQUE `username` (+ case-insensitive), FKs `role_id`, `company_id`, `location_id` |
+
+All four tables share `is_valid BOOLEAN NOT NULL DEFAULT TRUE` and
+`dt_entry_date TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP`, and use
+`id BIGINT GENERATED ALWAYS AS IDENTITY` primary keys.
+
+Model layer (`src/models/`): `companyModel`, `roleModel`, `companyLocationModel`, `userModel`.
+They use parameterized SQL, `withTransaction()` for multi-step writes, validate foreign keys before
+inserting, and map constraints to HTTP-friendly errors (`src/utils/errors.js`).
+
+Database-level rules worth knowing:
+
+- `userModel.register()` hashes passwords with bcrypt and always assigns `EMPLOYEE`; a role cannot be
+  supplied by the caller, so public registration can never create an `ADMIN`.
+- A user's `location_id` is rejected unless it belongs to the supplied `company_id`
+  (and the database also enforces `location_id ⇒ company_id`).
+- Default roles are seeded idempotently (`ON CONFLICT (role_code) DO NOTHING`) by migration `005`,
+  at startup, and by `npm run db:seed`.
+
+Full column list, ER diagram, and the migration/backward-compatibility policy live in
+**[DATABASE_DESIGN.md](DATABASE_DESIGN.md)**.
+
+
 
 ## SSL Configuration Details
 
@@ -298,6 +354,8 @@ underlying details are written to the server log only.
 | `npm run dev`   | Start with Node's built-in watcher (`node --watch`) for reloads. |
 | `npm run db:up` | Start the local PostgreSQL 18 container (`docker compose up -d`). |
 | `npm run db:down` | Stop the local container, keeping its data volume.             |
+| `npm run db:migrate` | Apply pending SQL migrations from `src/database/migrations/`. |
+| `npm run db:seed` | Insert the default roles (`ADMIN`, `EMPLOYEE`) if missing.     |
 
 Quick verification:
 
