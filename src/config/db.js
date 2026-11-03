@@ -3,7 +3,11 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-const { Pool } = require('pg');
+const { Pool, types } = require('pg');
+
+// node-postgres returns BIGINT (int8, OID 20) as a string to avoid precision loss.
+// Identity ids stay far below Number.MAX_SAFE_INTEGER, so expose them as JSON numbers.
+types.setTypeParser(types.builtins.INT8, (value) => Number(value));
 
 // TLS is required for remotely hosted PostgreSQL. Certificate validation stays
 // ON by default; only an explicit environment override can turn it off.
