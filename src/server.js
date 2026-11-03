@@ -1,23 +1,10 @@
 'use strict';
 
-const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const PROJECT_ROOT = path.resolve(__dirname, '..');
-
-/**
- * Configuration files are loaded before anything else.
- * `.env.local` (git-ignored developer overrides, e.g. a local Docker database)
- * takes precedence over `.env` (deployment values). Set ENV_FILE to load a
- * single explicit file instead, e.g. `ENV_FILE=.env.production npm start`.
- */
-const envFileNames = process.env.ENV_FILE ? [process.env.ENV_FILE] : ['.env.local', '.env'];
-const envFilePaths = envFileNames.map((fileName) => path.resolve(PROJECT_ROOT, fileName));
-
-require('dotenv').config({ path: envFilePaths, quiet: true });
-
-const loadedEnvFiles = envFilePaths.filter((filePath) => fs.existsSync(filePath));
+// Loads .env.local / .env (or ENV_FILE) before any other module reads configuration.
+const { loadedEnvFiles } = require('./config/env');
 
 const app = require('./app');
 const { closePool, getSslSummary } = require('./config/db');

@@ -154,4 +154,24 @@ const closePool = async () => {
   await openPool.end();
 };
 
-module.exports = { getPool, getSslSummary, closePool };
+/**
+ * Runs `callback(client)` inside a single transaction on a dedicated pooled client.
+ * Commits on success, rolls back on any error and always releases the client.
+ */
+const withTransaction = async (callback) => {
+  const client = await getPool().connect();
+
+  try {
+    await client.query('BEGIN');
+    const result = await callback(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+};
+
+module.exports = { getPool, getSslSummary, closePool, withTransaction };
