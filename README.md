@@ -111,6 +111,7 @@ All credentials come from env files (never hardcoded, never committed).
 | `DB_SSL_CA`                  | No       | –         | Inline provider CA bundle (PEM). Escape newlines as `\n`.                   |
 | `DB_SSL_CA_PATH`             | No       | –         | Path to a provider CA bundle file (PEM).                                    |
 | `DB_CONNECT_TIMEOUT_MS`      | No       | `10000`   | Connection attempt timeout in milliseconds.                                 |
+| `SERVER_HOST`                | No       | all interfaces | Bind address; `127.0.0.1` limits access to this machine.              |
 | `ENV_FILE`                   | No       | –         | Load one explicit env file instead of `.env.local` + `.env`.                |
 
 Example `.env.local` (local Docker, no TLS):
@@ -191,6 +192,22 @@ docker run -d --name emplence-postgres18 -p 5433:5432 \
 > Already have your own PostgreSQL container on `5432` (for example `postgres18`)? Either point
 > `DATABASE_URL` in `.env.local` at it (`postgresql://USER:PASSWORD@localhost:5432/default`) with
 > `DB_SSL_MODE=disable`, or stop it and use the Compose service on `5433`.
+
+### Access from an Android phone on the same Wi-Fi
+
+The API listens on all interfaces by default, so no code change is needed — only the Mac's LAN IP:
+
+```bash
+ipconfig getifaddr en0     # -> e.g. 192.168.1.22
+npm start                  # logs: [server] reachable on your network: http://192.168.1.22:3000
+```
+
+On the phone: `http://192.168.1.22:3000/hello`.
+Emulator: `http://10.0.2.2:3000/hello`. USB instead of Wi-Fi: `adb reverse tcp:3000 tcp:3000`
+then use `http://localhost:3000/hello`. Android apps need `usesCleartextTraffic` for plain HTTP
+in debug builds.
+
+Full troubleshooting: [LOCAL_SETUP.md §16](LOCAL_SETUP.md#16-access-hello-from-an-android-phone-on-the-same-wi-fi).
 
 ## PostgreSQL 18 Connection Setup
 

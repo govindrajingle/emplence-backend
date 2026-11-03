@@ -269,3 +269,81 @@ docker compose down -v
 rm -f .env.local
 ```
 
+
+## 16. Access `/hello` from an Android phone on the same Wi-Fi
+
+Both devices must be on the **same Wi-Fi network**, and the API must listen on all interfaces
+(the default).
+
+### 1. Find this machine's LAN IP
+
+```bash
+ipconfig getifaddr en0        # macOS Wi-Fi  -> e.g. 192.168.1.22
+# Linux:  ip -4 addr show | grep inet
+```
+
+### 2. Start the API (default: all interfaces)
+
+```bash
+npm start
+# [server] listening on http://localhost:3000 (bind: all interfaces)
+# [server] reachable on your network: http://192.168.1.22:3000
+```
+
+The second log line prints exactly the URL to use from the phone.
+
+### 3. Open the endpoint on the phone
+
+In Chrome (or any HTTP client) on the Android device:
+
+```text
+http://192.168.1.22:3000/hello
+```
+
+Expected:
+
+```json
+{
+  "message": "Hello! Backend is running successfully."
+}
+```
+
+### Sanity checks when the phone cannot load it
+
+```bash
+curl http://192.168.1.22:3000/hello        # on the Mac: must return 200 first
+lsof -nP -iTCP:3000 -sTCP:LISTEN           # must show *:3000 — NOT 127.0.0.1:3000
+```
+
+| Check | Fix |
+| ----- | --- |
+| `lsof` shows `127.0.0.1:3000` | You started with `SERVER_HOST=127.0.0.1`; restart with `npm start` (no override). |
+| Phone and Mac on different networks / guest Wi-Fi | Join the same SSID; guest and office networks often enable client isolation (the phone cannot reach the Mac). |
+| macOS firewall is on (System Settings → Network → Firewall) | Allow incoming connections for `node` when prompted, or `sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add $(which node)`. |
+| IP address changed after reconnecting | Re-run `ipconfig getifaddr en0` and use the new IP. |
+
+### Android app notes (not just the browser)
+
+- Android 9+ blocks **cleartext HTTP** by default. For debug builds add to
+  `AndroidManifest.xml`: `<application android:usesCleartextTraffic="true" ...>`, or use a
+  `network_security_config` limited to your dev host. Keep HTTPS in production.
+- Physical phone base URL: `http://192.168.1.22:3000/` (Retrofit/OkHttp/Volley).
+- Android **emulator** shortcut — the host machine is reachable as `10.0.2.2`:
+  `http://10.0.2.2:3000/hello`.
+- USB cable instead of Wi-Fi (works even on isolated networks):
+  ```bash
+  adb reverse tcp:3000 tcp:3000
+  # then use http://localhost:3000/hello inside the device/emulator
+  ```
+
+### Keep a stable URL (optional)
+
+DHCP may hand out a different address later. Add a DHCP reservation for the Mac in the router, or
+re-check `ipconfig getifaddr en0` and update the app's base URL.
+
+### Restrict the API to this machine only
+
+```bash
+SERVER_HOST=127.0.0.1 npm start     # not reachable from the phone
+```
+
