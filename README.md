@@ -43,6 +43,7 @@ emplence-backend/
 │   │   └── helloRoutes.js          # /hello routes
 │   └── views/                      # Reserved; responses are JSON (no templates needed)
 ├── docker-compose.yml              # Local PostgreSQL 18 container (development only)
+├── LOCAL_SETUP.md                  # Step-by-step local Docker command reference
 ├── .env.example                    # Production/hosted template (TLS required)
 ├── .env.local.example              # Local Docker template (TLS disabled)
 ├── .gitignore                      # Ignores node_modules, .env*, certificates
@@ -140,6 +141,9 @@ DB_CONNECT_TIMEOUT_MS=10000
 > `DATABASE_URL is not a valid PostgreSQL connection URI.`
 
 ## Local Development with Docker (PostgreSQL 18, no TLS)
+
+> Full command-by-command walkthrough (install → database → API → verification → cleanup):
+> **[LOCAL_SETUP.md](LOCAL_SETUP.md)**.
 
 `docker-compose.yml` runs PostgreSQL 18 on host port **5433** (so an existing local PostgreSQL on
 `5432` keeps working; override with `LOCAL_DB_PORT`). The stock image serves **no TLS**, which is why
