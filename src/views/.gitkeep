@@ -1,0 +1,2 @@
+# JSON API: the view layer is serialized JSON responses, so no template views
+# are required yet. This placeholder keeps the MVC folder structure in place.
