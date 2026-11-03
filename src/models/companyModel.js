@@ -2,6 +2,7 @@
 
 const { getPool } = require('../config/db');
 const { createAppError, mapDatabaseError } = require('../utils/errors');
+const { hasOwn, parseBoolean, parseId, parseRequiredText } = require('../utils/validation');
 
 /** Model for `master_companies`: parent table of locations and users. */
 
@@ -75,4 +76,53 @@ const findAll = async ({ includeInvalid = false } = {}) => {
   return rows;
 };
 
-module.exports = { create, findById, findByCode, findAll };
+/**
+ * Partial update: only the fields present in `changes` are written.
+ * `id` is never updated; `company_code` uniqueness is enforced by the database.
+ */
+const update = async (id, changes = {}) => {
+  const companyId = parseId(id, 'companyId');
+  const assignments = [];
+  const values = [];
+
+  const set = (column, value) => {
+    values.push(value);
+    assignments.push(`${column} = $${values.length}`);
+  };
+
+  if (hasOwn(changes, 'companyName')) {
+    set('company_name', parseRequiredText(changes.companyName, 'companyName', 255));
+  }
+  if (hasOwn(changes, 'companyCode')) {
+    set('company_code', parseRequiredText(changes.companyCode, 'companyCode', 50));
+  }
+  if (hasOwn(changes, 'isValid')) {
+    set('is_valid', parseBoolean(changes.isValid, 'isValid'));
+  }
+
+  if (assignments.length === 0) {
+    throw createAppError(400, 'Provide at least one of: companyName, companyCode, isValid.');
+  }
+
+  values.push(companyId);
+
+  try {
+    const { rows } = await getPool().query(
+      `UPDATE master_companies
+          SET ${assignments.join(', ')}
+        WHERE id = $${values.length}
+        RETURNING ${COMPANY_COLUMNS}`,
+      values,
+    );
+
+    if (rows.length === 0) {
+      throw createAppError(404, `Company ${companyId} was not found.`);
+    }
+
+    return rows[0];
+  } catch (error) {
+    throw mapDatabaseError(error, { unique: 'That company code is already in use.' });
+  }
+};
+
+module.exports = { create, findById, findByCode, findAll, update };
