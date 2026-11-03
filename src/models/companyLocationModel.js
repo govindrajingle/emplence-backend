@@ -2,6 +2,7 @@
 
 const { getPool, withTransaction } = require('../config/db');
 const { createAppError, mapDatabaseError } = require('../utils/errors');
+const { hasOwn, parseBoolean, parseId, parseRequiredText } = require('../utils/validation');
 
 /**
  * Model for `companies_locations` (branches/offices/premises of a company).
@@ -111,4 +112,88 @@ const findByCompanyId = async (companyId, { includeInvalid = false } = {}) => {
   return rows;
 };
 
-module.exports = { create, findById, findByCompanyAndCode, findByCompanyId };
+/** All locations, optionally filtered by company. */
+const findAll = async ({ companyId, includeInvalid = false } = {}) => {
+  const filters = [];
+  const values = [];
+
+  if (companyId !== undefined && companyId !== null && companyId !== '') {
+    values.push(parseCompanyId(companyId));
+    filters.push(`company_id = $${values.length}`);
+  }
+  if (!includeInvalid) {
+    filters.push('is_valid = TRUE');
+  }
+
+  const { rows } = await getPool().query(
+    `SELECT ${LOCATION_COLUMNS}
+       FROM companies_locations
+      ${filters.length > 0 ? `WHERE ${filters.join(' AND ')}` : ''}
+      ORDER BY location_name`,
+    values,
+  );
+
+  return rows;
+};
+
+/**
+ * Partial update of a location.
+ *
+ * `company_id` is intentionally immutable: users may already reference this
+ * location, and moving it to another company would break the
+ * "location belongs to company" invariant. Create a new location instead.
+ */
+const update = async (id, changes = {}) => {
+  const locationId = parseId(id, 'locationId');
+  const assignments = [];
+  const values = [];
+
+  const set = (column, value) => {
+    values.push(value);
+    assignments.push(`${column} = $${values.length}`);
+  };
+
+  if (hasOwn(changes, 'companyId')) {
+    throw createAppError(
+      400,
+      'companyId cannot be changed; create a new location for the other company instead.',
+    );
+  }
+  if (hasOwn(changes, 'locationName')) {
+    set('location_name', parseRequiredText(changes.locationName, 'locationName', 255));
+  }
+  if (hasOwn(changes, 'locationCode')) {
+    set('location_code', parseRequiredText(changes.locationCode, 'locationCode', 50));
+  }
+  if (hasOwn(changes, 'isValid')) {
+    set('is_valid', parseBoolean(changes.isValid, 'isValid'));
+  }
+
+  if (assignments.length === 0) {
+    throw createAppError(400, 'Provide at least one of: locationName, locationCode, isValid.');
+  }
+
+  values.push(locationId);
+
+  try {
+    const { rows } = await getPool().query(
+      `UPDATE companies_locations
+          SET ${assignments.join(', ')}
+        WHERE id = $${values.length}
+        RETURNING ${LOCATION_COLUMNS}`,
+      values,
+    );
+
+    if (rows.length === 0) {
+      throw createAppError(404, `Location ${locationId} was not found.`);
+    }
+
+    return rows[0];
+  } catch (error) {
+    throw mapDatabaseError(error, {
+      unique: 'That location code already exists for this company.',
+    });
+  }
+};
+
+module.exports = { create, findById, findByCompanyAndCode, findByCompanyId, findAll, update };
