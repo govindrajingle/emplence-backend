@@ -3,13 +3,12 @@
 const express = require('express');
 
 const roleController = require('../controllers/roleController');
-const { requireAdminKey } = require('../middleware/adminKey');
 
 const router = express.Router();
 
-// Reads are public; role creation/update is backend-controlled (admin key required).
+// Authentication/authorisation is applied when the router is mounted (see routes/index.js).
 router.get('/', roleController.list);
-router.post('/', requireAdminKey, roleController.create);
-router.put('/:id', requireAdminKey, roleController.update);
+router.post('/', roleController.create);
+router.put('/:id', roleController.update);
 
 module.exports = router;

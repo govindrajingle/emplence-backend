@@ -1,21 +1,38 @@
 'use strict';
 
 const companyModel = require('../models/companyModel');
+const { assertGlobalActor, isGlobalActor } = require('../middleware/auth');
 const { parseOptionalBoolean } = require('../utils/validation');
 
-/** HTTP layer for `/api/companies`. */
+/**
+ * HTTP layer for `/api/companies`.
+ *
+ * Company users (sub-admins) can only read their own company; creating or
+ * editing company master records stays with the platform administrator.
+ */
 
 /** GET /api/companies?includeInvalid=true */
 const list = async (req, res) => {
-  const companies = await companyModel.findAll({
-    includeInvalid: parseOptionalBoolean(req.query.includeInvalid, 'includeInvalid'),
-  });
+  const includeInvalid = parseOptionalBoolean(req.query.includeInvalid, 'includeInvalid');
 
-  res.status(200).json({ count: companies.length, data: companies });
+  if (isGlobalActor(req.actor)) {
+    const companies = await companyModel.findAll({ includeInvalid });
+    return res.status(200).json({ count: companies.length, data: companies });
+  }
+
+  const company = await companyModel.findById(req.actor.companyId);
+
+  if (!company || (!includeInvalid && !company.is_valid)) {
+    return res.status(200).json({ count: 0, data: [] });
+  }
+
+  return res.status(200).json({ count: 1, data: [company] });
 };
 
-/** POST /api/companies — body: { companyName, companyCode } */
+/** POST /api/companies — platform administrator only. */
 const create = async (req, res) => {
+  assertGlobalActor(req.actor);
+
   const body = req.body ?? {};
 
   const company = await companyModel.create({
@@ -26,8 +43,10 @@ const create = async (req, res) => {
   res.status(201).json({ data: company });
 };
 
-/** PUT /api/companies/:id — body: any of { companyName, companyCode, isValid } */
+/** PUT /api/companies/:id — platform administrator only. */
 const update = async (req, res) => {
+  assertGlobalActor(req.actor);
+
   const company = await companyModel.update(req.params.id, req.body ?? {});
 
   res.status(200).json({ data: company });
