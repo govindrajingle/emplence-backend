@@ -60,8 +60,9 @@ emplence-backend/
 │   ├── models/
 │   │   ├── companyModel.js         # master_companies
 │   │   ├── roleModel.js            # master_roles (+ ensureDefaultRoles)
+│   │   ├── rolePermissionModel.js  # role_permissions (permission grants per role)
 │   │   ├── companyLocationModel.js # companies_locations
-│   │   ├── userModel.js            # users (bcrypt hashing, EMPLOYEE role)
+│   │   ├── userModel.js            # users (bcrypt hashing, created_by chain)
 │   │   └── databaseModel.js        # startup connection ping
 │   ├── routes/
 │   │   ├── index.js                # Mounts /hello, /api/auth and the /api/* resources
@@ -69,12 +70,16 @@ emplence-backend/
 │   │   ├── helloRoutes.js          # /hello
 │   │   ├── companyRoutes.js        # /api/companies
 │   │   ├── locationRoutes.js       # /api/companies-locations
-│   │   ├── roleRoutes.js           # /api/roles
+│   │   ├── roleRoutes.js           # /api/roles (+ /permissions)
 │   │   └── userRoutes.js           # /api/users
+│   ├── services/
+│   │   └── authorizationService.js # permissions + company scope + hierarchy rules
 │   ├── utils/
 │   │   ├── errors.js               # HTTP-aware app errors + PostgreSQL error mapping
 │   │   └── validation.js           # Shared id/text/boolean validators
 │   └── views/                      # Reserved; responses are JSON (no templates needed)
+├── test/
+│   └── authorization.test.js       # hierarchy / company isolation / permission tests
 ├── docker-compose.yml              # Local PostgreSQL 18 container (development only)
 ├── DATABASE_DESIGN.md              # Schema, relationships, ER diagram, migration policy
 ├── RESTEndpoints.md                # Full REST API reference (all endpoints)
@@ -284,13 +289,38 @@ Schema is versioned in `src/database/migrations/` and applied with `npm run db:m
 | Table | Purpose | Key constraints |
 | --- | --- | --- |
 | `master_companies` | Registered companies (root table) | PK `id`, UNIQUE `company_code` |
-| `master_roles` | Global roles (`ADMIN`, `EMPLOYEE`) and per-company roles | PK `id`, UNIQUE (`company_id`, `role_code`) NULLS NOT DISTINCT, FK `company_id`, CHECK `hierarchy_level > 0` |
+| `master_roles` | Global role templates + company roles (`hierarchy_level`: ADMIN 100, OWNER 200, MANAGER 250, employee 300) | PK `id`, UNIQUE (`company_id`, `role_code`) NULLS NOT DISTINCT, FK `company_id`, CHECK `hierarchy_level > 0` |
+| `role_permissions` | Permission grants per role (`USER_CREATE`, `USER_VIEW`, `USER_UPDATE`, `USER_DELETE`) | PK `id`, UNIQUE (`role_id`, `permission_code`), FK `role_id` → `master_roles` (cascade) |
 | `companies_locations` | Branches/offices of a company | PK `id`, FK `company_id` → `master_companies`, UNIQUE (`company_id`, `location_code`) |
-| `users` | Accounts with hashed passwords + assignment | PK `id`, UNIQUE `username` (+ case-insensitive), FKs `role_id`, `company_id`, `location_id` |
+| `users` | Accounts with hashed passwords + assignment + `created_by_user_id` | PK `id`, UNIQUE `username` (+ case-insensitive), FKs `role_id`, `company_id`, `location_id`, `created_by_user_id` |
 
-All four tables share `is_valid BOOLEAN NOT NULL DEFAULT TRUE` and
+All five tables share `is_valid BOOLEAN NOT NULL DEFAULT TRUE` and
 `dt_entry_date TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP`, and use
 `id BIGINT GENERATED ALWAYS AS IDENTITY` primary keys.
+
+Migration `007_hierarchical_permissions.sql` adds `role_permissions`, `users.created_by_user_id`, the
+role catalogue and the initial permission grants (idempotent; no destructive statements).
+
+### Authorization model (permission + hierarchy)
+
+Authorization is implemented once in `src/services/authorizationService.js` and called from controllers:
+
+1. actor is authenticated **and active**, its role is active (resolved from the DB on every request);
+2. the required **permission** (`USER_*`) is granted to the actor's role;
+3. **company** matches (global actors are exempt);
+4. `actor.hierarchyLevel < targetRole.hierarchyLevel` (strictly lower authority);
+5. target role is active and in scope.
+
+| Actor | Level | Can create | Can manage |
+| --- | ---: | --- | --- |
+| Administrator | 100 | owners, managers, employees — any company | anyone except itself |
+| Owner | 200 | managers, employees (own company) | managers/employees of own company |
+| Manager | 250 | employees (own company) | employees of own company |
+| Employee / Cleaner / Driver / … | 300 | – | – |
+
+`users.created_by_user_id` records the creator (Owner→Manager→Employee chain) and is always filled from
+the authenticated actor, never from the request body.
+
 
 Model layer (`src/models/`): `companyModel`, `roleModel`, `companyLocationModel`, `userModel`.
 They use parameterized SQL, `withTransaction()` for multi-step writes, validate foreign keys before
@@ -305,7 +335,7 @@ Database-level rules worth knowing:
 - `master_roles.company_id` is `NULL` for global roles and set for company roles; role codes are unique
   per company, so two companies can both own a `SUPERVISOR` role.
 - Default roles are seeded idempotently (`ON CONFLICT (company_id, role_code) DO NOTHING`) by
-  migrations `005`/`006`, at startup, and by `npm run db:seed`.
+  migrations `005`/`006`/`007`, at startup, and by `npm run db:seed`.
 
 Full column list, ER diagram, and the migration/backward-compatibility policy live in
 **[DATABASE_DESIGN.md](DATABASE_DESIGN.md)**.
@@ -389,7 +419,7 @@ and foreign-key behaviour. Summary:
 | --- | --- | --- | --- |
 | `GET` | `/hello` | Liveness check (original endpoint) | public |
 | `POST` | `/api/auth/login` | Log in, returns a company-scoped JWT | public |
-| `GET` | `/api/companies` | List companies (sub-admin: own only) | any actor |
+| `GET` | `/api/companies` | List companies (company users: own only) | any actor |
 | `POST` | `/api/companies` | Create a company | platform admin |
 | `PUT` | `/api/companies/:id` | Update a company | platform admin |
 | `GET` | `/api/companies-locations` | List locations (`?companyId=&includeInvalid=`) | any actor (scoped) |
@@ -399,22 +429,25 @@ and foreign-key behaviour. Summary:
 | `POST` | `/api/roles` | Create a role (subordinate level) | `ADMIN` actor |
 | `PUT` | `/api/roles/:id` | Update a role (own company) | `ADMIN` actor |
 | `GET` | `/api/users` | List users (`?companyId=&locationId=&includeInvalid=`) | any actor (scoped) |
-| `POST` | `/api/users` | Create a user (company sub-admin/staff) | `ADMIN` actor (scoped) |
-| `PUT` | `/api/users/:id` | Update a user | `ADMIN` actor (scoped) |
+| `POST` | `/api/users` | Create a user (Owner/Manager/Employee) | `USER_CREATE` (scoped) |
+| `PUT` | `/api/users/:id` | Update a user | `USER_UPDATE` (scoped) |
 
 > **Actors.** `x-admin-key: $ADMIN_API_KEY` is the bootstrap platform administrator (all companies).
-> A logged-in user sends `Authorization: Bearer <token>`; if the account has a company, the token is
-> scoped to it, so **company sub-admins never see other companies' data** (`403` on cross-company
-> access) and can only grant roles below their own hierarchy level.
+> A logged-in user sends `Authorization: Bearer <token>`; authority (permissions + hierarchy level) is
+> reloaded from the database on every request, so **company users never see other companies' data**
+> (`403` on cross-company access) and can only grant roles below their own level.
 
-### Company sub-admins and role hierarchy (summary)
+### Company roles, permissions and hierarchy (summary)
 
-- Platform admin creates the company, then a **sub-admin**: `POST /api/users` with
-  `roleCode: "ADMIN"` **and** `companyId` (via `x-admin-key`).
-- The sub-admin logs in with `POST /api/auth/login`; the returned token carries `companyId`.
-- With that token the sub-admin manages only its own locations/roles/users, e.g. creates
-  `SUPERVISOR` (`hierarchyLevel: 50`) and `WORKER` (`100`) roles, and assigns them to new users.
-- `ADMIN` has `hierarchyLevel: 1`, so a sub-admin can never create/promote another admin.
+- Roles are catalogued centrally (`ADMIN` 100, `OWNER` 200, `MANAGER` 250, employee roles 300) with
+  permission grants in `role_permissions`; only the platform administrator can create/update roles or
+  change permissions (`PUT /api/roles/:id/permissions`).
+- Platform admin creates a company **Owner** (`roleCode: "OWNER"`, `companyId`); the Owner logs in and
+  creates **Managers** (250); a Manager creates **employee-level** users such as `CLEANER`/`DRIVER`
+  (300). Each created user stores `created_by_user_id`.
+- A company user only ever sees its own company and only its **subordinates**; a Manager cannot create a
+  Manager, cannot touch an Owner and cannot manage another `ADMIN` (`403`).
+- Employees have no permissions and therefore cannot manage users at all.
 
 ### `GET /hello`
 
@@ -457,7 +490,8 @@ underlying details are written to the server log only.
 | `npm run db:up` | Start the local PostgreSQL 18 container (`docker compose up -d`). |
 | `npm run db:down` | Stop the local container, keeping its data volume.             |
 | `npm run db:migrate` | Apply pending SQL migrations from `src/database/migrations/`. |
-| `npm run db:seed` | Insert the default roles (`ADMIN`, `EMPLOYEE`) if missing.     |
+| `npm run db:seed` | Insert the default global roles (`ADMIN`, `EMPLOYEE`) if missing. |
+| `npm test` | Run the authorization test suite (needs the local DB + migrations). |
 
 Quick verification:
 

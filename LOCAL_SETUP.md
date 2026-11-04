@@ -145,10 +145,10 @@ Or open <http://localhost:3000/hello> in a browser.
 
 ## 7b. REST endpoints overview
 
-Full payloads, examples and foreign-key rules: [RESTEndpoints.md](RESTEndpoints.md).
-Ids increment per insert, so use the `id` returned by each create call rather than hard-coding `1`.
+Full payloads, examples and authorization rules: [RESTEndpoints.md](RESTEndpoints.md).
+Ids increment per insert, so use the `id` returned by each create call rather than hard-coding values.
 All `/api/*` routes need a credential: `x-admin-key: <ADMIN_API_KEY>` (platform admin) or
-`Authorization: Bearer <token>` from login.
+`Authorization: Bearer <token>` from login. Hierarchy: ADMIN 100 → OWNER 200 → MANAGER 250 → employee 300.
 
 ```bash
 # platform admin: create a company and capture its id
@@ -158,41 +158,48 @@ COMPANY_ID=$(curl -s -X POST http://localhost:3000/api/companies \
   -d '{"companyName":"Acme Corp","companyCode":"ACME001"}' \
   | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).data.id')
 
-# create a company sub-admin (ADMIN role + company = scoped account)
+# platform admin creates the company Owner (200)
 curl -s -X POST http://localhost:3000/api/users \
   -H 'Content-Type: application/json' \
   -H 'x-admin-key: local-dev-admin-key' \
-  -d "{\"username\":\"subadmin_acme\",\"password\":\"secret123\",\"roleCode\":\"ADMIN\",\"companyId\":$COMPANY_ID}"
+  -d "{\"username\":\"owner_acme\",\"password\":\"secret123\",\"roleCode\":\"OWNER\",\"companyId\":$COMPANY_ID}"
 
-# log in as the sub-admin and keep the token
-TOKEN=$(curl -s -X POST http://localhost:3000/api/auth/login \
+# Owner logs in
+OWNER_TOKEN=$(curl -s -X POST http://localhost:3000/api/auth/login \
   -H 'Content-Type: application/json' \
-  -d '{"username":"subadmin_acme","password":"secret123"}' \
+  -d '{"username":"owner_acme","password":"secret123"}' \
   | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).data.token')
 
-# scoped reads: only this company is visible
-curl -s http://localhost:3000/api/companies -H "Authorization: Bearer $TOKEN"
-curl -s http://localhost:3000/api/users -H "Authorization: Bearer $TOKEN"
-
-# sub-admin creates subordinate roles and users (company comes from the token)
-curl -s -X POST http://localhost:3000/api/roles \
+# Owner creates a Manager (250) — company + created_by are set server-side
+curl -s -X POST http://localhost:3000/api/users \
   -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"roleName":"Supervisor","roleCode":"SUPERVISOR","hierarchyLevel":50}'
+  -H "Authorization: Bearer $OWNER_TOKEN" \
+  -d '{"username":"manager_acme","password":"secret123","roleCode":"MANAGER"}'
 
-curl -s -X POST http://localhost:3000/api/roles \
+# Manager logs in and creates employee-level users (300)
+MANAGER_TOKEN=$(curl -s -X POST http://localhost:3000/api/auth/login \
   -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"roleName":"Worker","roleCode":"WORKER","hierarchyLevel":100}'
+  -d '{"username":"manager_acme","password":"secret123"}' \
+  | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).data.token')
 
 curl -s -X POST http://localhost:3000/api/users \
   -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"username":"supervisor1","password":"secret123","roleCode":"SUPERVISOR"}'
+  -H "Authorization: Bearer $MANAGER_TOKEN" \
+  -d '{"username":"cleaner_acme","password":"secret123","roleCode":"CLEANER"}'
+
+# denied by hierarchy (Manager cannot create a Manager) -> 403
+curl -s -X POST http://localhost:3000/api/users \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $MANAGER_TOKEN" \
+  -d '{"username":"manager2_acme","password":"secret123","roleCode":"MANAGER"}'
+
+# scoped reads: own company, subordinates only
+curl -s http://localhost:3000/api/users -H "Authorization: Bearer $OWNER_TOKEN"
+curl -s http://localhost:3000/api/roles -H "Authorization: Bearer $OWNER_TOKEN"
 ```
 
-Without `x-admin-key`, `POST/PUT /api/roles` answers `401` (or `503` when `ADMIN_API_KEY` is unset),
-and assigning a non-`EMPLOYEE` role to a user is rejected the same way.
+Role/permission writes are platform-administrator only (`x-admin-key` or a global `ADMIN` token):
+company users receive `403`. Run `npm test` for the automated version of all these rules.
 
 ## 7c. Watching the request logs
 
@@ -263,14 +270,19 @@ Stop the API with `Ctrl+C`; stop the database with `npm run db:down`.
 ## 9b. Database schema and migrations
 
 ```bash
-npm run db:migrate                                  # apply migrations 001..005
+npm run db:migrate                                  # apply migrations 001..007 (idempotent)
 docker exec emplence-postgres18 psql -U emplence -d default -c '\dt'
-docker exec emplence-postgres18 psql -U emplence -d default -c 'select id, role_name, role_code from master_roles order by id;'
+docker exec emplence-postgres18 psql -U emplence -d default -c 'select role_code, company_id, hierarchy_level from master_roles order by hierarchy_level, id;'
+docker exec emplence-postgres18 psql -U emplence -d default -c \"select r.role_code, string_agg(rp.permission_code, ',' order by rp.permission_code) as permissions from master_roles r left join role_permissions rp on rp.role_id = r.id and rp.is_valid group by r.id, r.role_code order by r.hierarchy_level;\"
 docker exec emplence-postgres18 psql -U emplence -d default -c 'select name, applied_at from schema_migrations order by name;'
+npm test                                            # authorization suite (22 checks)
 ```
 
-Expected tables: `master_companies`, `master_roles`, `companies_locations`, `users`, plus
-`schema_migrations` (bookkeeping). Expected roles: exactly two rows — `ADMIN` and `EMPLOYEE`.
+Expected tables: `master_companies`, `master_roles`, `role_permissions`, `companies_locations`, `users`,
+plus `schema_migrations` (bookkeeping). Expected global roles: `ADMIN` (100), `OWNER` (200),
+`MANAGER` (250) and employee-level roles (300: `EMPLOYEE`, `CLEANER`, `DRIVER`, `OFFICE_BOY`,
+`SECURITY_GUARD`, `RECEPTIONIST`); `ADMIN`/`OWNER`/`MANAGER` hold the four `USER_*` permissions, the
+level-300 roles hold none.
 Startup logs `[db] default roles already present` after the first run, which proves the seeding is
 idempotent. Schema details: [DATABASE_DESIGN.md](DATABASE_DESIGN.md).
 
@@ -358,8 +370,10 @@ DB_SSL_REJECT_UNAUTHORIZED=true
 | `[seed] failed: relation "master_roles" does not exist` | Same cause: run `npm run db:migrate` before `npm run db:seed`. |
 | `401 Authentication required` / `Invalid session token` | Log in via `POST /api/auth/login` and send `Authorization: Bearer <token>`, or use `x-admin-key: <ADMIN_API_KEY>`. |
 | `503 Authentication is not configured` | `JWT_SECRET` is missing: add it to `.env.local` (see `.env.local.example`) and restart. |
-| `403 You can only access ... your own company` | Expected tenant isolation: log in as that company's sub-admin instead of requesting another company's data. |
-| `403 ... assign roles with a lower authority` | A sub-admin cannot grant `ADMIN` or a peer-level role; create a subordinate role first (`hierarchyLevel` greater than your own). |
+| `403 You can only manage records of your own company` | Expected tenant isolation: log in as that company's Owner/Manager instead of targeting another company. |
+| `403 Missing required permission: USER_...` | The role has no grant for that action: an Administrator can grant it with `PUT /api/roles/:id/permissions`. |
+| `403 ... lower authority` | Hierarchy rule: Manager (250) cannot create/update Manager (250) or Owner (200); Owners can manage Managers/Employees only. |
+| `403 This account is inactive` / `role ... is inactive` | Reactivate the user (`PUT /api/users/:id {"isValid":true}`) or the role via the platform administrator. |
 | No `-->` request lines in the console | They are `DEBUG` level: start with `LOG_LEVEL=debug` (the `.env.local` example already sets it). |
 | `EADDRINUSE: address already in use :::3000` | `lsof -nP -iTCP:3000 -sTCP:LISTEN` then `pkill -f 'node src/server.js'`, or `PORT=3001 npm start`. |
 | `failed to connect to the docker API` / `Cannot connect to the Docker daemon` | Docker Desktop is not running: `open -a Docker`, then `docker info`. |

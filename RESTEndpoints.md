@@ -45,11 +45,11 @@ On a phone/another device on the same Wi-Fi use the LAN address printed at start
 | --- | --- | --- | --- |
 | Platform administrator (bootstrap) | `x-admin-key: $ADMIN_API_KEY` | all companies | highest (hierarchy 0) |
 | Global admin user (created with no company) | Bearer token, `companyId: null` | all companies | hierarchy of its role (`ADMIN` = 1) |
-| **Company sub-admin** (created with a company) | Bearer token carrying that `companyId` | **only its own company** | its role's hierarchy level |
+| **Company user** (Owner / Manager / Employee with a company) | Bearer token carrying that `companyId` | **only its own company** | its role's hierarchy level + permissions |
 
-A company sub-admin can never see or change another company's companies, locations, roles or users —
+A company user can never see or change another company's companies, locations, roles or users —
 these requests are answered with `403 Forbidden`. Requests are also pinned automatically: when a
-sub-admin omits `companyId`, it is filled with its own company.
+company user omits `companyId`, it is filled with its own company.
 
 ### `POST /api/auth/login`
 
@@ -115,47 +115,71 @@ curl -X POST http://localhost:3000/api/users \
 The resulting user has `role_code = ADMIN` **and** `company_id = 3`, which is what makes it a
 sub-admin: on login the token is scoped to company 3.
 
-### Role hierarchy
+### Role hierarchy and permissions
 
 `master_roles.hierarchy_level` orders authority — **lower number = more authority**:
 
-| Role | Scope | `hierarchyLevel` |
-| --- | --- | --- |
-| `ADMIN` | global (seeded) | `1` |
-| company roles created by a sub-admin (e.g. `SUPERVISOR`) | company | e.g. `50` |
-| `EMPLOYEE` | global (seeded) | `100` |
+| Role | Registered scope | `hierarchyLevel` | Permissions |
+| --- | --- | ---: | --- |
+| `ADMIN` | global (platform administrator) | `100` | `USER_CREATE`, `USER_VIEW`, `USER_UPDATE`, `USER_DELETE` |
+| `OWNER` | company owner (role template is global, user carries `companyId`) | `200` | all four |
+| `MANAGER` | company manager | `250` | all four |
+| `EMPLOYEE`, `CLEANER`, `DRIVER`, `OFFICE_BOY`, `SECURITY_GUARD`, `RECEPTIONIST`, any custom role | employee level | `300` | none |
+| custom company roles (e.g. `SUPERVISOR`) | owned by one company | chosen ≥ 250 | assigned explicitly |
 
-Rules enforced by the API:
+Permissions are stored in `role_permissions` and are **checked separately** from hierarchy:
+`GET /api/roles` returns each role's `permissions` array, and `PUT /api/roles/:id/permissions`
+(platform administrator only) replaces it.
 
-- A sub-admin can only create/update roles **of its own company** and only with
-  `hierarchyLevel` **greater than its own** (it cannot create a peer or a superior).
-- A sub-admin can only assign roles whose `hierarchyLevel` is greater than its own, so it can never
-  create another `ADMIN` (or a role above itself).
-- A sub-admin cannot modify a user whose authority is equal to or higher than its own.
-- Global actors (`x-admin-key`, global admin) are not restricted by hierarchy.
+Authorization rules (enforced in `src/services/authorizationService.js`, not in controllers):
+
+1. Authenticated **and** active user; role must be active (checked on every request from the DB).
+2. Required **permission** must be granted to the actor's role (`USER_CREATE` / `USER_VIEW` / `USER_UPDATE`).
+3. **Company** of the target must match the actor's (global actors are exempt).
+4. **Hierarchy**: `actor.hierarchyLevel < targetRole.hierarchyLevel` (strictly lower authority).
+5. Target role must be **active** and inside the actor's company scope.
+
+Consequences:
+
+- Admin (100) → Owner (200) / Manager (250) / Employee (300): allowed.
+- Owner (200) → Manager (250) / Employee (300): allowed; Owner → Owner (200): denied.
+- Manager (250) → Employee categories (300): allowed; Manager → Manager (250) or Owner (200): denied.
+- Employee (300) → anything: denied (no permissions and no lower level).
+- A company user can never read or write another company's users, even with a valid token.
+- No one may manage **their own** account through `/api/users`.
 
 ## Endpoint summary
 
 `Auth` column: **public** = no credentials, **any actor** = Bearer token or `x-admin-key`,
-**admin** = `ADMIN` role actor (global admin or company sub-admin), **platform** = bootstrap key or
-company-less admin only.
+**admin** = actor holding the required `USER_*` permission, **platform** = platform administrator
+(`ADMIN` / bootstrap, i.e. global actor with hierarchy ≤ 100).
 
 | # | Method | Endpoint | Purpose | Auth | Company scoped |
 | --- | --- | --- | --- | --- | --- |
 | 1 | `GET` | `/hello` | Liveness check (original endpoint) | public | – |
 | 2 | `POST` | `/api/auth/login` | Exchange username/password for a token | public | – |
-| 3 | `GET` | `/api/companies` | List companies | any actor | yes (sub-admin sees only its own) |
+| 3 | `GET` | `/api/companies` | List companies | any actor | yes (company users see only their own) |
 | 4 | `POST` | `/api/companies` | Create a company | platform | – |
 | 5 | `PUT` | `/api/companies/:id` | Update a company | platform | – |
 | 6 | `GET` | `/api/companies-locations` | List locations | any actor | yes |
 | 7 | `POST` | `/api/companies-locations` | Create a location | any actor | yes (forced) |
 | 8 | `PUT` | `/api/companies-locations/:id` | Update a location | any actor | yes |
-| 9 | `GET` | `/api/roles` | List roles | any actor | yes (global + own company) |
-| 10 | `POST` | `/api/roles` | Create a role | admin | yes (forced; subordinate level) |
-| 11 | `PUT` | `/api/roles/:id` | Update a role | admin | yes (own company roles only) |
-| 12 | `GET` | `/api/users` | List users | any actor | yes |
-| 13 | `POST` | `/api/users` | Create a user | admin | yes (forced; subordinate role) |
-| 14 | `PUT` | `/api/users/:id` | Update a user | admin | yes (own company, lower authority) |
+| 9 | `GET` | `/api/roles` | List roles with permission codes | any actor | yes (global + own company) |
+| 10 | `POST` | `/api/roles` | Create a role | platform | – (may target a company) |
+| 11 | `PUT` | `/api/roles/:id` | Update a role | platform | – |
+| 12 | `PUT` | `/api/roles/:id/permissions` | Replace a role's permission set | platform | – |
+| 13 | `GET` | `/api/users` | List users | `USER_VIEW` | yes (subordinates only for company users) |
+| 14 | `POST` | `/api/users` | Create a user | `USER_CREATE` | yes (forced; subordinate role) |
+| 15 | `PUT` | `/api/users/:id` | Update a user | `USER_UPDATE` | yes (own company, lower authority) |
+
+**User creation matrix** (validated server-side; company ids and hierarchy from the request are ignored):
+
+| Actor | Can create | Company stored | `created_by_user_id` |
+| --- | --- | --- | --- |
+| Administrator (100) | `OWNER`, `MANAGER`, employee roles — any company | as requested (or `NULL`) | actor's user id |
+| Owner (200) | `MANAGER` (250), employee roles (300) | actor's company | owner's user id |
+| Manager (250) | employee roles (300) | actor's company | manager's user id |
+| Employee (300) | nothing (`403`) | – | – |
 
 ## 1. GET /hello
 
@@ -372,22 +396,24 @@ Errors: `400` no updatable field / blank value / `companyId` supplied · `404` l
 
 Roles are the backbone of company tenancy:
 
-- **Global roles** (`company_id = null`, seeded): `ADMIN` (hierarchy `1`) and `EMPLOYEE` (`100`).
-- **Company roles** (`company_id = <company>`): created by that company's sub-admin, e.g.
-  `SUPERVISOR` (`50`), `WORKER` (`100`). A code may exist in several companies because uniqueness is
-  `(company_id, role_code)`.
+- **Global templates** (`company_id = null`): `ADMIN` (100), `OWNER` (200), `MANAGER` (250),
+  `EMPLOYEE`/`CLEANER`/`DRIVER`/`OFFICE_BOY`/`SECURITY_GUARD`/`RECEPTIONIST` (300).
+- **Company roles** (`company_id = <company>`): e.g. a `SUPERVISOR` owned by one company. A code may
+  exist in several companies because uniqueness is `(company_id, role_code)`.
+- Each role carries its **permission codes** (`role_permissions`): `ADMIN`, `OWNER` and `MANAGER` hold
+  all four `USER_*` permissions; employee-level roles hold none.
 
 **Who can do what**
 
-| Operation | Global actor (`x-admin-key` / company-less admin) | Company sub-admin |
+| Operation | Platform administrator (`ADMIN` / `x-admin-key`) | Company users (Owner/Manager/…) |
 | --- | --- | --- |
-| `GET /api/roles` | every role | global roles + own company roles |
-| `POST /api/roles` | global role or any company role | own company only, `hierarchyLevel` **>** own |
-| `PUT /api/roles/:id` | any role | own company roles only, level stays **>** own |
+| `GET /api/roles` | every role | global roles + own company roles, read-only |
+| `POST /api/roles` | global role or role for any company | `403` |
+| `PUT /api/roles/:id` | any role | `403` |
+| `PUT /api/roles/:id/permissions` | any role | `403` |
 
-`MASTER`/`ADMIN`-style elevation is impossible for sub-admins: `ADMIN` sits at level `1`, so it is
-never greater than a sub-admin's own level. Role writes require the `ADMIN` role; unauthenticated
-requests get `401`, non-admin roles get `403`.
+Roles are catalogued centrally so a company user can never mint authority for itself. Assigning a
+role to a user is still governed by the hierarchy rules (section “Role hierarchy and permissions”).
 
 ### 5.1 `GET /api/roles`
 
@@ -399,16 +425,16 @@ requests get `401`, non-admin roles get `403`.
 curl http://localhost:3000/api/roles -H "Authorization: Bearer $TOKEN"
 ```
 
-**Response — `200 OK`** (company sub-admin of Acme)
+**Response — `200 OK`** (company user of company 3)
 
 ```json
 {
   "count": 4,
   "data": [
-    { "id": 1, "role_name": "Administrator", "role_code": "ADMIN", "company_id": null, "hierarchy_level": 1, "is_valid": true, "dt_entry_date": "2026-11-03T13:30:00.000Z" },
-    { "id": 12, "role_name": "Supervisor", "role_code": "SUPERVISOR", "company_id": 3, "hierarchy_level": 50, "is_valid": true, "dt_entry_date": "2026-11-03T13:35:12.789Z" },
-    { "id": 13, "role_name": "Worker", "role_code": "WORKER", "company_id": 3, "hierarchy_level": 100, "is_valid": true, "dt_entry_date": "2026-11-03T13:35:20.101Z" },
-    { "id": 2, "role_name": "Employee", "role_code": "EMPLOYEE", "company_id": null, "hierarchy_level": 100, "is_valid": true, "dt_entry_date": "2026-11-03T13:30:00.000Z" }
+    { "id": 1, "role_name": "Administrator", "role_code": "ADMIN", "company_id": null, "hierarchy_level": 100, "is_valid": true, "dt_entry_date": "2026-11-03T13:30:00.000Z", "permissions": ["USER_CREATE","USER_DELETE","USER_UPDATE","USER_VIEW"] },
+    { "id": 79, "role_name": "Owner", "role_code": "OWNER", "company_id": null, "hierarchy_level": 200, "is_valid": true, "dt_entry_date": "2026-11-03T13:30:00.000Z", "permissions": ["USER_CREATE","USER_DELETE","USER_UPDATE","USER_VIEW"] },
+    { "id": 12, "role_name": "Supervisor", "role_code": "SUPERVISOR", "company_id": 3, "hierarchy_level": 250, "is_valid": true, "dt_entry_date": "2026-11-03T13:35:12.789Z", "permissions": [] },
+    { "id": 2, "role_name": "Employee", "role_code": "EMPLOYEE", "company_id": null, "hierarchy_level": 300, "is_valid": true, "dt_entry_date": "2026-11-03T13:30:00.000Z", "permissions": [] }
   ]
 }
 ```
@@ -416,27 +442,21 @@ curl http://localhost:3000/api/roles -H "Authorization: Bearer $TOKEN"
 Roles are ordered by `hierarchy_level` (higher authority first) and never include another
 company's roles.
 
-### 5.2 `POST /api/roles` — requires the `ADMIN` role
+### 5.2 `POST /api/roles` — platform administrator only
 
 | Body field | Type | Required | Constraint |
 | --- | --- | --- | --- |
 | `roleName` | string (≤100) | ✅ | must not be blank |
 | `roleCode` | string (≤50) | ✅ | uppercase; **unique per company** (`uq_master_roles_company_code`) |
-| `companyId` | integer / null | No | `null` = global role (global actors only). Sub-admins: forced to own company |
-| `hierarchyLevel` | integer > 0 | No | default `100`; must be **greater than the caller's** level for sub-admins |
+| `companyId` | integer / null | No | `null` = global template, otherwise the owning company |
+| `hierarchyLevel` | integer > 0 | No | default `300`; use 250 for manager-equivalent roles |
 
 ```bash
-# company sub-admin creating a subordinate role (company comes from the token)
-curl -X POST http://localhost:3000/api/roles \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"roleName":"Supervisor","roleCode":"SUPERVISOR","hierarchyLevel":50}'
-
-# platform administrator creating a global role
+# platform administrator creating a company-specific supervisor role
 curl -X POST http://localhost:3000/api/roles \
   -H 'Content-Type: application/json' \
   -H "x-admin-key: $ADMIN_API_KEY" \
-  -d '{"roleName":"Auditor","roleCode":"AUDITOR","hierarchyLevel":5}'
+  -d '{"roleName":"Supervisor","roleCode":"SUPERVISOR","companyId":34,"hierarchyLevel":250}'
 ```
 
 **Response — `201 Created`**
@@ -456,57 +476,86 @@ curl -X POST http://localhost:3000/api/roles \
 ```
 
 Errors: `400` missing/blank value, unknown company, invalid `hierarchyLevel` · `401` not authenticated ·
-`403` not an `ADMIN`, other company, or a level that is not subordinate · `409` duplicate code in that
-company.
+`403` not the platform administrator · `409` duplicate code in that company.
 
-### 5.3 `PUT /api/roles/:id` — requires the `ADMIN` role
+### 5.3 `PUT /api/roles/:id` — platform administrator only
 
 | Body field | Type | Required | Constraint |
 | --- | --- | --- | --- |
 | `roleName` | string (≤100) | No | must not be blank |
 | `roleCode` | string (≤50) | No | unique per company |
-| `hierarchyLevel` | integer > 0 | No | sub-admins: must stay greater than their own level |
-| `isValid` | boolean | No | soft delete (users keep the role reference) |
+| `hierarchyLevel` | integer > 0 | No | ordering authority (e.g. 250 for supervisor/manager level) |
+| `isValid` | boolean | No | deactivating revokes access for users holding the role |
 | `companyId` | – | ❌ | rejected with `400` — a role cannot move between companies |
 
 ```bash
 curl -X PUT http://localhost:3000/api/roles/12 \
   -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"roleName":"Shift Supervisor","hierarchyLevel":40}'
+  -H "x-admin-key: $ADMIN_API_KEY" \
+  -d '{"roleName":"Shift Supervisor","hierarchyLevel":260}'
 ```
 
 **Response — `200 OK`** — `{ "data": { ...role... } }`
 
-Errors: `401` invalid admin key · `503` disabled · `400` no updatable field ·
+Errors: `401` not authenticated · `403` not the platform administrator · `400` no updatable field ·
 `404` role not found · `409` duplicate `roleCode`.
 
-> Renaming/soft-deleting `ADMIN` or `EMPLOYEE` is allowed but discouraged: the seeding logic only
-> inserts missing codes, and `userModel.register()` depends on `EMPLOYEE` existing.
+### 5.4 `PUT /api/roles/:id/permissions` — platform administrator only
+
+Replaces the role's permission set (codes not listed are deactivated).
+
+| Body field | Type | Required | Constraint |
+| --- | --- | --- | --- |
+| `permissions` | string[] | ✅ | array of `USER_CREATE` / `USER_VIEW` / `USER_UPDATE` / `USER_DELETE` (uppercase, extensible) |
+
+```bash
+curl -X PUT http://localhost:3000/api/roles/12/permissions \
+  -H 'Content-Type: application/json' \
+  -H "x-admin-key: $ADMIN_API_KEY" \
+  -d '{"permissions":["USER_VIEW","USER_CREATE"]}'
+```
+
+**Response — `200 OK`**
+
+```json
+{ "data": { "roleId": 12, "roleCode": "SUPERVISOR", "permissions": ["USER_CREATE", "USER_VIEW"] } }
+```
+
+Errors: `400` unknown permission format · `401` not authenticated · `403` not the platform
+administrator · `404` role not found.
+
+> Renaming/deactivating `ADMIN` or `EMPLOYEE` is allowed but discouraged: seeding only inserts missing
+> codes, and `userModel.register()` depends on `EMPLOYEE` existing.
 
 
 ## 6. Users
 
-A user row references three tables: `role_id` (required), `company_id` (optional) and `location_id`
-(optional, and only valid together with a company that owns that location). Passwords are hashed with
-bcrypt before insert; the hash is never returned by any endpoint.
+A user row references four relationships: `role_id` (required), `company_id` (optional),
+`location_id` (optional, only valid together with its company) and `created_by_user_id` (who created
+the account — set by the server from the authenticated actor). Passwords are hashed with bcrypt; the
+hash is never returned.
 
-A user's **company** defines its tenancy: a user with `company_id` set is a company sub-admin/employee
-and, when logged in, only sees that company's data. Users without a company are global.
+A user's **company** defines its tenancy: a company user only ever sees that company's data. Users
+without a company are global. Authorization combines **permission** (`role_permissions`) and
+**hierarchy** (`actor.hierarchyLevel < targetRole.hierarchyLevel`).
 
 **Who can do what**
 
-| Operation | Global actor | Company sub-admin |
-| --- | --- | --- |
-| `GET /api/users` | all users, optional filters | own company only (`403` if it asks for another) |
-| `POST /api/users` | any company, any role | own company only; role must be subordinate |
-| `PUT /api/users/:id` | any user | own company users, lower authority only |
+| Operation | Administrator (100) | Owner (200) | Manager (250) | Employee (300) |
+| --- | --- | --- | --- | --- |
+| `GET /api/users` | all users, all companies | own company, subordinates only | own company, subordinates only | `403` (no `USER_VIEW`) |
+| `POST /api/users` | any role, any company | `MANAGER`, employee roles, own company | employee roles, own company | `403` (no `USER_CREATE`) |
+| `PUT /api/users/:id` | any user | own company, lower authority | own company, lower authority | `403` (no `USER_UPDATE`) |
+| manage own account | – | – | – | – |
+
+Additional guarantees: a user can never be moved to another company by a company user, can never be
+given a role at or above the actor's authority, and cannot modify itself through this API.
 
 ### 6.1 `GET /api/users`
 
 | Query parameter | Type | Default | Description |
 | --- | --- | --- | --- |
-| `companyId` | integer | – | Only users of this company (sub-admins: own company, others `403`) |
+| `companyId` | integer | – | Only users of this company (company users: own company, others `403`) |
 | `locationId` | integer | – | Only users assigned to this location |
 | `includeInvalid` | boolean | `false` | Include users with `is_valid = false` |
 
@@ -522,53 +571,62 @@ curl 'http://localhost:3000/api/users?companyId=1&locationId=1'
   "count": 1,
   "data": [
     {
-      "id": 1,
-      "username": "jdoe",
-      "role_id": 2,
-      "role_code": "EMPLOYEE",
-      "company_id": 1,
-      "location_id": 1,
+      "id": 21,
+      "username": "cleaner1",
+      "role_id": 84,
+      "role_code": "CLEANER",
+      "hierarchy_level": 300,
+      "company_id": 34,
+      "location_id": 26,
+      "created_by_user_id": 40,
       "is_valid": true,
-      "dt_entry_date": "2026-11-03T13:40:00.000Z"
+      "dt_entry_date": "2026-11-04T13:40:00.000Z"
     }
   ]
 }
 ```
 
-`role_code` comes from a join with `master_roles`; no `password` field is ever selected.
+`role_code`/`hierarchy_level` come from a join with `master_roles`, `created_by_user_id` shows who
+created the account, and no `password` field is ever selected. Company users only receive their
+subordinates (strictly lower authority), never peers or superiors.
 
-### 6.2 `POST /api/users` — requires the `ADMIN` role
+### 6.2 `POST /api/users` — requires `USER_CREATE`
 
 | Body field | Type | Required | Constraint |
 | --- | --- | --- | --- |
 | `username` | string (3–100) | ✅ | **unique**, case-insensitive |
 | `password` | string (8–72) | ✅ | stored as bcrypt hash, never returned |
 | `roleCode` | string | No | default `EMPLOYEE`; resolved in the target company scope (**FK** → `master_roles`) |
-| `companyId` | integer / null | No | **FK** → `master_companies.id`; sub-admins: forced to own company |
+| `companyId` | integer / null | No | **FK** → `master_companies.id`; company actors: forced to own company |
 | `locationId` | integer / null | No | **FK** → `companies_locations.id`; must belong to `companyId` and be `is_valid`; requires `companyId` |
 
-Role resolution: the company's own role with that code wins over the global one. A sub-admin can only
-assign roles whose `hierarchyLevel` is greater than its own, so `ADMIN` (level `1`) is refused with
-`403`.
+Server-side validation order: `USER_CREATE` permission → company scope → role active/in scope →
+`actor.hierarchyLevel < role.hierarchyLevel` → insert (with `created_by_user_id = actor.userId`) in one
+transaction. Any `hierarchyLevel` sent by the client is ignored.
 
 ```bash
-# platform administrator creating a company sub-admin
+# platform administrator creating a company Owner
 curl -X POST http://localhost:3000/api/users \
   -H 'Content-Type: application/json' \
   -H "x-admin-key: $ADMIN_API_KEY" \
-  -d '{"username":"subadmin_acme","password":"secret123","roleCode":"ADMIN","companyId":3}'
+  -d '{"username":"owner_acme","password":"secret123","roleCode":"OWNER","companyId":34}'
 
-# company sub-admin creating a subordinate user (company comes from the token)
+# Owner creating a Manager (company comes from the token)
 curl -X POST http://localhost:3000/api/users \
   -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"username":"supervisor1","password":"secret123","roleCode":"SUPERVISOR"}'
+  -H "Authorization: Bearer $OWNER_TOKEN" \
+  -d '{"username":"manager1","password":"secret123","roleCode":"MANAGER"}'
 
-# company sub-admin creating a worker at a location of its company
+# Manager creating a Cleaner / Driver (employee level)
 curl -X POST http://localhost:3000/api/users \
   -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"username":"worker1","password":"secret123","roleCode":"WORKER","locationId":11}'
+  -H "Authorization: Bearer $MANAGER_TOKEN" \
+  -d '{"username":"cleaner1","password":"secret123","roleCode":"CLEANER"}'
+
+curl -X POST http://localhost:3000/api/users \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $MANAGER_TOKEN" \
+  -d '{"username":"driver1","password":"secret123","roleCode":"DRIVER"}'
 ```
 
 **Response — `201 Created`**
@@ -577,55 +635,54 @@ curl -X POST http://localhost:3000/api/users \
 {
   "data": {
     "id": 21,
-    "username": "worker1",
-    "role_id": 13,
-    "company_id": 3,
-    "location_id": 11,
+    "username": "cleaner1",
+    "role_id": 84,
+    "company_id": 34,
+    "location_id": null,
+    "created_by_user_id": 41,
     "is_valid": true,
-    "dt_entry_date": "2026-11-03T13:40:00.000Z"
+    "dt_entry_date": "2026-11-04T13:40:00.000Z"
   }
 }
 ```
 
 Errors: `400` validation / unknown role in scope / unknown company / location not in company /
-`locationId` without `companyId` · `401` not authenticated · `403` not `ADMIN`, other company, or a role
-that is not subordinate to the caller · `409` username already taken (case-insensitive).
+`locationId` without `companyId` · `401` not authenticated · `403` missing `USER_CREATE`, other
+company, inactive actor/role, or a role at/above the actor's authority · `409` username already taken.
 
-### 6.3 `PUT /api/users/:id` — requires the `ADMIN` role
+### 6.3 `PUT /api/users/:id` — requires `USER_UPDATE`
 
 | Body field | Type | Required | Constraint |
 | --- | --- | --- | --- |
 | `username` | string (3–100) | No | unique (case-insensitive) |
 | `password` | string (8–72) | No | re-hashed with bcrypt |
-| `roleCode` | string | No | existing role in the target company scope, must be subordinate to the caller |
-| `companyId` | integer / null | No | global actors only; sub-admins receive `403` |
+| `roleCode` | string | No | existing active role in the target company scope, subordinate to the actor |
+| `companyId` | integer / null | No | global actors only; company users receive `403` |
 | `locationId` | integer / null | No | must belong to the effective company (after this update) |
-| `isValid` | boolean | No | soft delete / reactivate |
+| `isValid` | boolean | No | deactivate / reactivate |
 
-Target user restrictions for sub-admins: the user must belong to their company and have a strictly
-lower authority (so a sub-admin cannot edit itself or a peer `ADMIN`).
+Target restrictions: the target must be in the actor's company and have a **strictly lower** authority;
+the actor cannot target itself. A Manager cannot touch an Owner, a peer Manager or an Administrator.
 
 ```bash
-curl -X PUT http://localhost:3000/api/users/1 \
+# Manager deactivating a cleaner of its company
+curl -X PUT http://localhost:3000/api/users/21 \
   -H 'Content-Type: application/json' \
-  -d '{"companyId":1,"locationId":1}'
+  -H "Authorization: Bearer $MANAGER_TOKEN" \
+  -d '{"isValid":false}'
 
-# clear the assignment: location first, then company (order within one call is irrelevant)
-curl -X PUT http://localhost:3000/api/users/1 \
-  -H 'Content-Type: application/json' \
-  -d '{"companyId":null,"locationId":null}'
-
-# promote to ADMIN (admin key required)
-curl -X PUT http://localhost:3000/api/users/1 \
+# Administrator promoting a user across companies
+curl -X PUT http://localhost:3000/api/users/21 \
   -H 'Content-Type: application/json' \
   -H "x-admin-key: $ADMIN_API_KEY" \
-  -d '{"roleCode":"ADMIN"}'
+  -d '{"roleCode":"MANAGER","companyId":34}'
 ```
 
 **Response — `200 OK`** — `{ "data": { ...user... } }`
 
 Errors: `400` no updatable field / `locationId` without company / location not in the company /
-unknown role or company · `401` privileged role change without admin key · `404` user not found ·
+unknown role or company · `401` not authenticated · `403` missing `USER_UPDATE`, other company, equal or
+higher authority, self-management, or a role change above the actor · `404` user not found ·
 `409` duplicate username.
 
 > Changing only `companyId` while the user still has a location from the old company returns `400`.
@@ -643,6 +700,8 @@ unknown role or company · `401` privileged role change without admin key · `40
 | `companyId` (roles) | `fk_master_roles_company` | `master_companies.id` | model (pre-check within transaction) + DB | `400 Company {id} does not exist or is not valid.` |
 | `companyId` (locations, update) | – | – | model rule | `400 companyId cannot be changed; create a new location for the other company instead.` |
 | `companyId` (roles, update) | – | – | model rule | `400 companyId cannot be changed on an existing role.` |
+| `created_by_user_id` (users) | `fk_users_created_by` | `users.id` | model (creator pre-check) + DB | `400 Creating user {id} does not exist.` |
+| `role_id` (role_permissions) | `fk_role_permissions_role` | `master_roles.id` | model (`role` lookup) + DB | `404 Role {id} was not found.` |
 
 Database-level guarantees that back these up:
 
@@ -683,8 +742,8 @@ Practical implications when building clients:
 ## Local smoke test
 
 Identity ids increment and are not reset by deleting rows, so always use the `id` returned by the
-previous call instead of hard-coding `1`. `ADMIN_API_KEY` and `JWT_SECRET` come from `.env.local`
-(see `.env.local.example`).
+previous call instead of hard-coding values. `ADMIN_API_KEY` and `JWT_SECRET` come from `.env.local`
+(see `.env.local.example`). For the automated version of these scenarios run `npm test`.
 
 ```bash
 # 1. start the API
@@ -698,52 +757,52 @@ COMPANY_ID=$(curl -s -X POST http://localhost:3000/api/companies \
   -d '{"companyName":"Acme Corp","companyCode":"ACME001"}' \
   | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).data.id')
 
-# 3. create a location for it (FK: companyId must exist and be valid)
-LOCATION_ID=$(curl -s -X POST http://localhost:3000/api/companies-locations \
-  -H 'Content-Type: application/json' \
-  -H "x-admin-key: $ADMIN_API_KEY" \
-  -d "{\"companyId\":$COMPANY_ID,\"locationName\":\"Head Office\",\"locationCode\":\"HO\"}" \
-  | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).data.id')
-
-# 4. create the company sub-admin (ADMIN role + company = scoped account)
+# 3. platform administrator creates the company Owner (hierarchy 200)
 curl -s -X POST http://localhost:3000/api/users \
   -H 'Content-Type: application/json' \
   -H "x-admin-key: $ADMIN_API_KEY" \
-  -d "{\"username\":\"subadmin_acme\",\"password\":\"secret123\",\"roleCode\":\"ADMIN\",\"companyId\":$COMPANY_ID,\"locationId\":$LOCATION_ID}"
+  -d "{\"username\":\"owner_acme\",\"password\":\"secret123\",\"roleCode\":\"OWNER\",\"companyId\":$COMPANY_ID}"
 
-# 5. log in as the sub-admin
-TOKEN=$(curl -s -X POST http://localhost:3000/api/auth/login \
+# 4. log in as the Owner
+OWNER_TOKEN=$(curl -s -X POST http://localhost:3000/api/auth/login \
   -H 'Content-Type: application/json' \
-  -d '{"username":"subadmin_acme","password":"secret123"}' \
+  -d '{"username":"owner_acme","password":"secret123"}' \
   | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).data.token')
 
-# 6. the token only ever sees this company
-curl -s http://localhost:3000/api/companies -H "Authorization: Bearer $TOKEN"
-curl -s http://localhost:3000/api/users -H "Authorization: Bearer $TOKEN"
-
-# 7. create subordinate roles for the company (SUPERVISOR -> WORKER)
-curl -s -X POST http://localhost:3000/api/roles \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"roleName":"Supervisor","roleCode":"SUPERVISOR","hierarchyLevel":50}'
-
-curl -s -X POST http://localhost:3000/api/roles \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"roleName":"Worker","roleCode":"WORKER","hierarchyLevel":100}'
-
-# 8. create users with those roles (company is taken from the token)
+# 5. Owner creates a Manager (250) — company + created_by are filled server-side
 curl -s -X POST http://localhost:3000/api/users \
   -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"username":"supervisor1","password":"secret123","roleCode":"SUPERVISOR"}'
+  -H "Authorization: Bearer $OWNER_TOKEN" \
+  -d '{"username":"manager_acme","password":"secret123","roleCode":"MANAGER"}'
+
+# 6. Manager logs in and creates employee-level users (300)
+MANAGER_TOKEN=$(curl -s -X POST http://localhost:3000/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"manager_acme","password":"secret123"}' \
+  | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).data.token')
+
+curl -s -X POST http://localhost:3000/api/users \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $MANAGER_TOKEN" \
+  -d '{"username":"cleaner_acme","password":"secret123","roleCode":"CLEANER"}'
+
+# 7. denied by hierarchy / permission (expect 403)
+curl -s -X POST http://localhost:3000/api/users \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $MANAGER_TOKEN" \
+  -d '{"username":"manager2_acme","password":"secret123","roleCode":"MANAGER"}'
+
+# 8. scoped reads: Owner sees only its company's subordinates
+curl -s http://localhost:3000/api/users -H "Authorization: Bearer $OWNER_TOKEN"
+curl -s http://localhost:3000/api/roles -H "Authorization: Bearer $OWNER_TOKEN"
 
 # 9. public liveness endpoint
 curl -s http://localhost:3000/hello
 ```
 
-Expected: the sub-admin's `GET /api/companies` returns exactly one company, `GET /api/users` only users
-of that company, and requesting another company's data answers `403`.
+Expected: step 7 answers `403` (a Manager cannot create a Manager), the Owner's `GET /api/users`
+returns only that company's Managers/Employees, and `GET /api/roles` includes each role's
+`permissions` array.
 
 Schema, constraints and the ER diagram: [DATABASE_DESIGN.md](DATABASE_DESIGN.md).
 Local setup commands: [LOCAL_SETUP.md](LOCAL_SETUP.md).

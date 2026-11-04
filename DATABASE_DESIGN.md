@@ -119,6 +119,19 @@ seeded: `ADMIN`, `EMPLOYEE`) or **owned by one company**, created by that compan
 - **Seed data:** global `Administrator`/`ADMIN` (`hierarchy_level = 1`) and `Employee`/`EMPLOYEE` (`100`) — migration `005` + `006`, see section D
 - **Write access:** only through authenticated `ADMIN` actors — a company sub-admin is limited to its own company and to subordinate hierarchy levels
 
+**Role catalogue (migration `007`)** — lower `hierarchy_level` = more authority:
+
+| `role_code` | `role_name` | `hierarchy_level` | Scope | Permissions |
+| --- | --- | ---: | --- | --- |
+| `ADMIN` | Administrator | 100 | global | `USER_CREATE`, `USER_VIEW`, `USER_UPDATE`, `USER_DELETE` |
+| `OWNER` | Owner | 200 | global template, used with a company | all four |
+| `MANAGER` | Manager | 250 | global template, used with a company | all four |
+| `CLEANER`, `DRIVER`, `OFFICE_BOY`, `SECURITY_GUARD`, `RECEPTIONIST`, `EMPLOYEE` | employee categories | 300 | global templates | none |
+
+Company-specific roles are also supported: `company_id` is set and `(company_id, role_code)` stays
+unique, so two companies may each own a `SUPERVISOR` (level ≥ 250) row. The hierarchy check is what
+restricts *who* may be managed — identical permissions do **not** mean identical authority.
+
 
 ### B.3 `companies_locations`
 
@@ -153,6 +166,7 @@ seeded: `ADMIN`, `EMPLOYEE`) or **owned by one company**, created by that compan
 | `role_id` | `BIGINT` | No | – | FK → `master_roles.id`; assigned by backend logic (`ADMIN` + `company_id` = company sub-admin) |
 | `company_id` | `BIGINT` | **Yes** | – | FK → `master_companies.id`; nullable while a user has no organization |
 | `location_id` | `BIGINT` | **Yes** | – | FK → `companies_locations.id`; requires `company_id` |
+| `created_by_user_id` | `BIGINT` | **Yes** | – | Self-FK → `users.id`; who created the account (`NULL` for historical rows) |
 | `is_valid` | `BOOLEAN` | No | `TRUE` | Record validity |
 | `dt_entry_date` | `TIMESTAMP` | No | `CURRENT_TIMESTAMP` | Creation timestamp |
 
@@ -164,16 +178,50 @@ seeded: `ADMIN`, `EMPLOYEE`) or **owned by one company**, created by that compan
   - `fk_users_role (role_id)` → `master_roles (id)`, `ON UPDATE CASCADE ON DELETE RESTRICT`
   - `fk_users_company (company_id)` → `master_companies (id)`, `ON UPDATE CASCADE ON DELETE RESTRICT`
   - `fk_users_location (location_id)` → `companies_locations (id)`, `ON UPDATE CASCADE ON DELETE RESTRICT`
+  - `fk_users_created_by (created_by_user_id)` → `users (id)`, `ON UPDATE CASCADE ON DELETE SET NULL`
 - **Check constraints:**
   - `chk_users_username_not_blank`, `chk_users_password_not_blank`
   - `chk_users_location_requires_company (location_id IS NULL OR company_id IS NOT NULL)`
-- **Indexes:** `idx_users_role_id`, `idx_users_company_id`, `idx_users_location_id`
-- **Backend-enforced rules (`userModel`):**
+- **Indexes:** `idx_users_role_id`, `idx_users_company_id`, `idx_users_location_id`, `idx_users_created_by_user_id`
+- **Backend-enforced rules (`userModel` + `authorizationService`):**
   - Public registration resolves the `EMPLOYEE` role server-side and accepts **no** role input, so nobody can self-assign `ADMIN`.
   - Passwords are hashed with `bcryptjs` (cost `BCRYPT_SALT_ROUNDS`, default 10) before the insert; the hash is never returned by model reads.
   - When both `companyId` and `locationId` are supplied, the location must belong to that company **and** both must be `is_valid`; otherwise the write is rejected with `400` inside the same transaction.
   - `locationId` without `companyId` is rejected before touching the database.
+  - `created_by_user_id` is filled from the authenticated actor (never from the request body), so
+    Owner→Manager and Manager→Employee chains are auditable; historical rows keep `NULL`.
   - All queries use parameter placeholders (`$1`, `$2`, …) — no string interpolation of values.
+
+### B.5 `role_permissions`
+
+**Purpose:** explicit permission grants per role (migration `007`). Permissions answer *what* a role may
+do; `hierarchy_level` answers *whom* it may act on. Both are required.
+
+| Column | Data type | Nullable | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `id` | `BIGINT` | No | identity | Primary key |
+| `role_id` | `BIGINT` | No | – | FK → `master_roles.id` (`ON DELETE CASCADE`) |
+| `permission_code` | `VARCHAR(100)` | No | – | `USER_CREATE`, `USER_VIEW`, `USER_UPDATE`, `USER_DELETE` |
+| `is_valid` | `BOOLEAN` | No | `TRUE` | Revoking sets this to `FALSE` (row is kept for audit) |
+| `dt_entry_date` | `TIMESTAMP` | No | `CURRENT_TIMESTAMP` | Creation timestamp |
+
+- **Primary key:** `pk_role_permissions (id)`
+- **Unique constraint:** `uq_role_permissions_role_code (role_id, permission_code)`
+- **Foreign key:** `fk_role_permissions_role (role_id)` → `master_roles (id)`, `ON UPDATE CASCADE ON DELETE CASCADE`
+- **Check constraint:** `chk_role_permissions_code_not_blank`
+- **Index:** `idx_role_permissions_code (permission_code)`
+- **Seeded matrix (migration `007`, applies to every role with `hierarchy_level < 300`):**
+
+  | Role | `USER_CREATE` | `USER_VIEW` | `USER_UPDATE` | `USER_DELETE` |
+  | --- | --- | --- | --- | --- |
+  | Administrator (100) | ✅ | ✅ | ✅ | ✅ |
+  | Owner (200) | ✅ | ✅ | ✅ | ✅ |
+  | Manager (250) | ✅ | ✅ | ✅ | ✅ |
+  | Employee / Cleaner / Driver / … (300) | – | – | – | – |
+
+  Grants are inserted with `ON CONFLICT (role_id, permission_code) DO NOTHING`, so re-running the
+  migration never duplicates rows. Newly created roles start **without** permissions and are granted
+  explicitly via `PUT /api/roles/:id/permissions` (platform administrator only).
 
 
 ## C. Entity Relationships
@@ -188,6 +236,8 @@ All relationships are **one-to-many** and are enforced by foreign keys with
 | 3 | `master_companies` | `users` | `users.company_id` (nullable) | 1 : N | A company has many users (sub-admins and staff); assignment may happen after registration |
 | 4 | `companies_locations` | `users` | `users.location_id` (nullable) | 1 : N | A location can host many users; requires `company_id` |
 | 5 | `master_companies` | `master_roles` | `master_roles.company_id` (nullable) | 1 : N | A company owns its own roles (e.g. `SUPERVISOR`); `NULL` marks a global role |
+| 6 | `master_roles` | `role_permissions` | `role_permissions.role_id` | 1 : N | A role has several permission grants (`USER_CREATE`, …) |
+| 7 | `users` | `users` | `users.created_by_user_id` (nullable) | 1 : N | Audit chain: who created which account (Owner → Manager → Employee) |
 
 ```mermaid
 erDiagram
@@ -195,7 +245,9 @@ erDiagram
     master_companies ||--o{ users : employs
     master_companies ||--o{ master_roles : owns
     master_roles ||--o{ users : assigned_to
+    master_roles ||--o{ role_permissions : grants
     companies_locations ||--o{ users : assigned_to
+    users ||--o{ users : created
 
     master_companies {
         bigint id PK
@@ -211,6 +263,14 @@ erDiagram
         varchar role_code
         bigint company_id FK
         integer hierarchy_level
+        boolean is_valid
+        timestamp dt_entry_date
+    }
+
+    role_permissions {
+        bigint id PK
+        bigint role_id FK
+        varchar permission_code
         boolean is_valid
         timestamp dt_entry_date
     }
@@ -231,13 +291,15 @@ erDiagram
         bigint role_id FK
         bigint company_id FK
         bigint location_id FK
+        bigint created_by_user_id FK
         boolean is_valid
         timestamp dt_entry_date
     }
 ```
 
 > `master_roles.role_code` is unique **per company** (`company_id, role_code`, `NULLS NOT DISTINCT`),
-> and `companies_locations.location_code` is unique per company as well — see sections B.2 and B.3.
+> `companies_locations.location_code` is unique per company, and `role_permissions` is unique per
+> `(role_id, permission_code)` — see sections B.2, B.3 and B.5.
 
 **Referential integrity split**
 
@@ -251,74 +313,115 @@ erDiagram
 
 ## D. Initial Master Data
 
-Two **global** roles (`company_id IS NULL`) are created by the schema/seed process:
+Global role templates (`company_id IS NULL`) are created by the schema/seed process:
 
 | `role_name` | `role_code` | `hierarchy_level` | Scope | Meaning |
 | --- | --- | --- | --- | --- |
-| `Administrator` | `ADMIN` | `1` | global | Highest authority. Without a company it is the platform administrator; with a company it is that company's **sub-admin** |
-| `Employee` | `EMPLOYEE` | `100` | global | Default role for self-registered users and the lowest authority |
+| `Administrator` | `ADMIN` | `100` | global | Platform administrator: all companies, all permissions |
+| `Owner` | `OWNER` | `200` | global template | Company owner: manages managers and employees of its company |
+| `Manager` | `MANAGER` | `250` | global template | Manages employee-level users of its company |
+| `Employee` | `EMPLOYEE` | `300` | global template | Default self-registration role; no management rights |
+| `Cleaner`, `Driver`, `Office Boy`, `Security Guard`, `Receptionist` | `CLEANER`, `DRIVER`, `OFFICE_BOY`, `SECURITY_GUARD`, `RECEPTIONIST` | `300` | global templates | Employee categories (same level as `EMPLOYEE`, no permissions) |
 
-`id` values are generated by the identity column, so never hard-code them in code — always resolve
-roles by `role_code` inside a company scope (`roleModel.findByCode(code, { companyId })`).
+`id` values are generated by the identity column, so never hard-code them — always resolve roles by
+`role_code` inside a company scope (`roleModel.findByCode(code, { companyId })`).
 
-### How the global roles are created (triple safety, all idempotent)
+### How the roles are created (idempotent, safe on every environment)
 
-1. **Migration** `005_seed_master_roles.sql` (before role scoping existed):
-   ```sql
-   INSERT INTO master_roles (role_name, role_code)
-   VALUES ('Administrator', 'ADMIN'), ('Employee', 'EMPLOYEE')
-   ON CONFLICT (role_code) DO NOTHING;
-   ```
-   `006_scope_roles_to_companies.sql` then adds `company_id`/`hierarchy_level` and sets `ADMIN` to
-   level `1` and `EMPLOYEE` to level `100`.
-2. **Application startup** — `roleModel.ensureDefaultRoles()` inserts the same two roles as global
-   roles with `ON CONFLICT (company_id, role_code) DO NOTHING`, so a fresh or partially prepared
-   database still ends up with both roles, and repeated restarts never create duplicates (verified:
-   exactly two global role rows remain).
+1. **Migration `005`** seeded `ADMIN`/`EMPLOYEE`; **`006`** added `company_id`/`hierarchy_level`;
+   **`007`** normalises the known codes to `ADMIN=100`, `OWNER=200`, `MANAGER=250`, `EMPLOYEE=300`
+   and inserts the missing templates (`MANAGER`, `CLEANER`, …) with
+   `ON CONFLICT (company_id, role_code) DO NOTHING`.
+2. **Application startup** — `roleModel.ensureDefaultRoles()` re-inserts `ADMIN`/`EMPLOYEE` as global
+   roles with the same `ON CONFLICT` clause, so a fresh or partially prepared database still ends up
+   with both, and restarts never create duplicates.
 3. **Manual/CI seeding** — `npm run db:seed` calls the same model function.
 
-Because `(company_id, role_code)` is UNIQUE with `NULLS NOT DISTINCT`, "duplicate on restart" is
-impossible at the database level as well.
+### Permission grants
 
-### Company sub-admins and company roles
+`role_permissions` holds the grants; `007` grants all four `USER_*` permissions to every role with
+`hierarchy_level < 300` (ADMIN, OWNER, MANAGER and any custom role below employee level) and nothing to
+employee-level roles. Grants are `ON CONFLICT (role_id, permission_code) DO NOTHING`, so the seed is
+repeatable. Newly created roles start without permissions and are granted explicitly by the platform
+administrator (`PUT /api/roles/:id/permissions`).
 
-Company staff are modelled without new tables:
+**Permissions ≠ authority:** Owner and Manager both hold `USER_CREATE`, but the hierarchy check
+(`actor.hierarchyLevel < targetRole.hierarchyLevel`) still stops a Manager from creating another
+Manager or touching an Owner.
 
-- A **sub-admin** is a user whose `role_id` points at `ADMIN` **and** whose `company_id` is set.
-  Login issues a token scoped to that company, so the sub-admin only ever sees that company's
-  locations, roles and users.
-- Sub-admins create **company roles** (`master_roles.company_id` = their company), for example
-  `SUPERVISOR` at level `50` and `WORKER` at level `100`. Another company may define its own
-  `SUPERVISOR` because uniqueness is per company.
-- Hierarchy rule: an actor may only create/assign roles whose `hierarchy_level` is **greater** than its
-  own. Since `ADMIN` is level `1`, a sub-admin can neither create a peer admin nor promote anyone to
-  `ADMIN`.
+### Company-specific roles
 
-Example (sub-admin of company 3, logged in with a company-scoped token):
+- `company_id` is nullable: `NULL` = global template (usable by any company), otherwise the role is
+  owned by one company.
+- `(company_id, role_code)` is unique with `NULLS NOT DISTINCT`, so two companies may each own a
+  `SUPERVISOR` (level ≥ 250) row while global codes stay unique.
+- A global actor may create roles for a company (`POST /api/roles { companyId }`); the company's own
+  roles are only visible to its users (`GET /api/roles` returns global roles + own company roles).
 
 ```sql
+-- example: a company-specific role for company 34
 INSERT INTO master_roles (role_name, role_code, company_id, hierarchy_level)
-VALUES ('Supervisor', 'SUPERVISOR', 3, 50),
-       ('Worker',     'WORKER',     3, 100);
+VALUES ('Supervisor', 'SUPERVISOR', 34, 250)
+ON CONFLICT (company_id, role_code) DO NOTHING;
 ```
 
-The API performs exactly this insert through `POST /api/roles` after validating the token's company and
-hierarchy level.
+### User creation workflow (who creates whom)
+
+| Actor | May create | Company written | `created_by_user_id` |
+| --- | --- | --- | --- |
+| `ADMIN` (global) | any role in any company, including `OWNER`/`MANAGER` | request value or `NULL` | admin user id (`NULL` for bootstrap key) |
+| `OWNER` (company 34) | `MANAGER` (250), `EMPLOYEE`/`CLEANER`/… (300) | forced `34` | owner user id |
+| `MANAGER` (company 34) | `EMPLOYEE`/`CLEANER`/`DRIVER`/… (300) | forced `34` | manager user id |
+| `EMPLOYEE` and other level-300 roles | – (no permissions) | – | – |
+
+Creation is validated in this order: permission (`USER_CREATE`) → company access → role active and in
+scope → hierarchy (`actor.hierarchyLevel < role.hierarchy_level`) → insert with `created_by_user_id`
+inside one transaction.
 
 ### Adding more roles
 
-Roles are **never created through public endpoints** — writes require an authenticated `ADMIN` actor,
-and a company sub-admin is confined to its own company and subordinate levels. To add a **global** role
-in every environment:
+Role/permission writes are **platform-administrator only** (`assertPlatformAdministrator`); company
+users cannot create roles. To add a **global** role in every environment:
 
-1. Add a migration (for example `007_add_auditor_role.sql`) with
-   `INSERT INTO master_roles (role_name, role_code, company_id, hierarchy_level) VALUES ('Auditor', 'AUDITOR', NULL, 5) ON CONFLICT (company_id, role_code) DO NOTHING;`
-2. Reference it in code by `role_code` + scope, never by numeric id.
+1. Add a migration (for example `008_add_auditor_role.sql`) with
+   `INSERT INTO master_roles (role_name, role_code, company_id, hierarchy_level) VALUES ('Auditor', 'AUDITOR', NULL, 150) ON CONFLICT (company_id, role_code) DO NOTHING;`
+   followed by the desired `role_permissions` grants (or use `PUT /api/roles/:id/permissions`).
+2. Reference it in code by `role_code` + scope, never by numeric id; the authorization logic reads
+   `hierarchy_level` and permissions, so new roles need no code change.
 3. Keep it out of `userModel.register()`, which always resolves `EMPLOYEE` and accepts no role argument.
 4. Apply with `npm run db:migrate` and update this document.
 
 
 ## E. Future Database Changes
+
+### Migration `007_hierarchical_permissions.sql` — applied changes & manual review
+
+Applied safely (no `DROP`/`TRUNCATE`, idempotent, existing rows preserved):
+
+1. `users.created_by_user_id BIGINT` + `fk_users_created_by … ON DELETE SET NULL` + index —
+   historical users keep `NULL`.
+2. Known global roles normalised: `ADMIN=100`, `OWNER=200`, `MANAGER=250`, `EMPLOYEE=300`.
+3. Missing global templates inserted (`MANAGER`, `CLEANER`, `DRIVER`, `OFFICE_BOY`,
+   `SECURITY_GUARD`, `RECEPTIONIST`) with `ON CONFLICT (company_id, role_code) DO NOTHING`.
+4. `role_permissions` created (`UNIQUE (role_id, permission_code)`, FK cascade) and the four
+   `USER_*` grants applied to every role with `hierarchy_level < 300`.
+
+**Deliberately not automated (review these manually):**
+
+- **Custom/legacy roles** (`SELECT id, role_code, company_id, hierarchy_level FROM master_roles WHERE hierarchy_level NOT IN (100,200,250,300);`)
+  keep their existing level — changing unknown roles could silently alter authority. Reassign them a
+  level from the catalogue if needed, with `UPDATE master_roles SET hierarchy_level = … WHERE id = …`.
+- **Existing company owners** already on `OWNER` (like user 38) need no data change: authority is
+  derived from the role level, not stored on the user.
+- **Company-specific copies** of OWNER/MANAGER are not created automatically. If a company must own
+  its own role row, insert it with `company_id` set; global templates already cover the standard flow.
+- **Permissions for custom roles** are not granted automatically; assign them explicitly:
+  `PUT /api/roles/:id/permissions { "permissions": ["USER_VIEW"] }`.
+- **Passwords were not touched**, and no user's role was changed.
+
+Rollback (if ever required) is a compensating migration: drop `role_permissions`,
+drop `fk_users_created_by` + `users.created_by_user_id`, and restore the previous hierarchy numbers.
+Prefer fixing forward with a new migration.
 
 ### Migration rules (apply to every change)
 
