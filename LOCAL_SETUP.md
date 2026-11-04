@@ -194,6 +194,38 @@ curl -s -X POST http://localhost:3000/api/users \
 Without `x-admin-key`, `POST/PUT /api/roles` answers `401` (or `503` when `ADMIN_API_KEY` is unset),
 and assigning a non-`EMPLOYEE` role to a user is rejected the same way.
 
+## 7c. Watching the request logs
+
+Every request is logged by the single-file framework in `src/middleware/requestLogger.js`
+(filter chain: request id → `-->` line → `<--` line with endpoint, status and duration).
+
+```bash
+npm start                                  # LOG_LEVEL / LOG_REQUEST_BODY from .env.local
+LOG_LEVEL=debug npm start                  # also show the incoming request lines + bodies
+LOG_LEVEL=warn npm start                   # only 4xx/5xx + errors
+LOG_LEVEL=error LOG_REQUEST_BODY=false npm start
+```
+
+Example output:
+
+```text
+2026-11-04T04:39:52.709Z DEBUG --> POST /api/auth/login req=6b066b15 ip=::1
+2026-11-04T04:39:52.729Z WARN  <-- POST /api/auth/login req=6b066b15 status=401 ms=19.6 ip=::1 body={"username":"ghost","password":"[redacted]"}
+2026-11-04T04:39:52.750Z INFO  <-- POST /api/companies req=36f19c10 status=201 ms=7.0 ip=::1 actor=bootstrap company=all
+```
+
+Inspect a single request from the client side — the same id is returned as a response header:
+
+```bash
+curl -s -i http://localhost:3000/hello | grep -i x-request-id
+```
+
+Logs are console-only, so persist them by redirecting:
+
+```bash
+npm start > api.log 2>&1        # then: tail -f api.log
+```
+
 ## 8. Inspect the database
 
 ```bash
@@ -328,6 +360,7 @@ DB_SSL_REJECT_UNAUTHORIZED=true
 | `503 Authentication is not configured` | `JWT_SECRET` is missing: add it to `.env.local` (see `.env.local.example`) and restart. |
 | `403 You can only access ... your own company` | Expected tenant isolation: log in as that company's sub-admin instead of requesting another company's data. |
 | `403 ... assign roles with a lower authority` | A sub-admin cannot grant `ADMIN` or a peer-level role; create a subordinate role first (`hierarchyLevel` greater than your own). |
+| No `-->` request lines in the console | They are `DEBUG` level: start with `LOG_LEVEL=debug` (the `.env.local` example already sets it). |
 | `EADDRINUSE: address already in use :::3000` | `lsof -nP -iTCP:3000 -sTCP:LISTEN` then `pkill -f 'node src/server.js'`, or `PORT=3001 npm start`. |
 | `failed to connect to the docker API` / `Cannot connect to the Docker daemon` | Docker Desktop is not running: `open -a Docker`, then `docker info`. |
 | `port is already allocated` on `db:up` | Port 5433 is taken: `docker compose down`, or `LOCAL_DB_PORT=5440 docker compose up -d` (and update `DATABASE_URL`). |

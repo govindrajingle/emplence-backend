@@ -34,6 +34,8 @@ On a phone/another device on the same Wi-Fi use the LAN address printed at start
 - **Route naming:** the locations resource is `/api/companies-locations` (plural, hyphenated).
 - **Authentication:** every `/api/*` route except `POST /api/auth/login` requires either a
   `Authorization: Bearer <token>` header or the bootstrap `x-admin-key` header. `/hello` stays public.
+- **Request id:** every response carries an `x-request-id` header that also appears in the server logs
+  (`req=…`) together with the endpoint name, status code and duration.
 
 ## Authentication and company tenancy
 

@@ -55,7 +55,8 @@ emplence-backend/
 │   │       └── 005_seed_master_roles.sql
 │   ├── middleware/
 │   │   ├── adminKey.js             # x-admin-key validation (bootstrap access)
-│   │   └── auth.js                 # JWT sign/verify + company scope & hierarchy guards
+│   │   ├── auth.js                 # JWT sign/verify + company scope & hierarchy guards
+│   │   └── requestLogger.js        # Single-file logging framework + request filter chain
 │   ├── models/
 │   │   ├── companyModel.js         # master_companies
 │   │   ├── roleModel.js            # master_roles (+ ensureDefaultRoles)
@@ -153,6 +154,8 @@ All credentials come from env files (never hardcoded, never committed).
 | `ADMIN_API_KEY`              | No       | –         | Bootstrap `x-admin-key` for the platform administrator; unset disables it.  |
 | `JWT_SECRET`                 | No*      | –         | Signing secret for login tokens; **required** for `POST /api/auth/login` (503 without it). |
 | `AUTH_TOKEN_TTL_SECONDS`     | No       | `28800`   | Login token lifetime (8 h).                                                 |
+| `LOG_LEVEL`                  | No       | `info`    | `debug` \| `info` \| `warn` \| `error` — controls console logging.           |
+| `LOG_REQUEST_BODY`           | No       | `false`   | Log request bodies too (password/token keys are redacted).                  |
 | `ENV_FILE`                   | No       | –         | Load one explicit env file instead of `.env.local` + `.env`.                |
 
 Example `.env.local` (local Docker, no TLS):
@@ -331,6 +334,51 @@ Implementation notes:
 - The `pg` driver lets an `sslmode` query parameter override explicitly passed TLS options, so
   `sslmode` is stripped from `DATABASE_URL` and the `DB_SSL_*` variables remain the single source
   of truth. Keeping `?sslmode=require` in the URI is therefore harmless and optional.
+
+## Request Logging
+
+All logging lives in one file — `src/middleware/requestLogger.js`. It provides:
+
+1. **A filter chain** (`attachRequestId → logRequestStart → logRequestComplete`) mounted first in
+   `src/app.js`, so every request is logged with its endpoint and status code. Filters call `next()`
+   to continue, or `next(error)` to short-circuit into error handling.
+2. **An action logger** (`logger.info/warn/error/exception`) used for startup, database, seeding and
+   error-handler messages.
+
+Every request gets an 8-character id (`req=…`) that is also returned as the `x-request-id` response
+header, and appears on both the `-->` and `<--` lines.
+
+Sample output (`LOG_LEVEL=debug`, `LOG_REQUEST_BODY=true`):
+
+```text
+2026-11-04T04:39:52.709Z DEBUG --> POST /api/auth/login req=6b066b15 ip=::1
+2026-11-04T04:39:52.727Z WARN  POST /api/auth/login rejected: Invalid username or password. req=6b066b15 status=401 method=POST endpoint=/api/auth/login
+2026-11-04T04:39:52.729Z WARN  <-- POST /api/auth/login req=6b066b15 status=401 ms=19.6 ip=::1 body={"username":"ghost","password":"[redacted]","token":"[redacted]"}
+2026-11-04T04:39:52.743Z DEBUG --> POST /api/companies req=36f19c10 ip=::1
+2026-11-04T04:39:52.750Z INFO  <-- POST /api/companies req=36f19c10 status=201 ms=7.0 ip=::1 actor=bootstrap company=all body={"companyName":"LogTest","companyCode":"LOGTEST1"}
+2026-11-04T04:39:58.101Z WARN  <-- PUT /api/users/:id req=4678ee2a status=404 ms=2.1 ip=::1 actor=bootstrap company=all
+```
+
+Behaviour:
+
+| Rule | Detail |
+| --- | --- |
+| Endpoint name | requested path with numeric ids collapsed to `:id` (`/api/users/12` → `/api/users/:id`) |
+| Level by status | `2xx/3xx` → `INFO`, `4xx` → `WARN`, `5xx` → `ERROR` |
+| Request line | `DEBUG` only (visible with `LOG_LEVEL=debug`) |
+| Redaction | `password`, `token`, `authorization`, `x-admin-key`, `jwt` (and similar) are always `[redacted]`; keys/strings longer than 200 chars are truncated |
+| Bodies | logged only when `LOG_REQUEST_BODY=true` |
+| Filtering | `LOG_LEVEL=warn` shows only warnings/errors (e.g. 4xx/5xx requests) |
+| Actor context | logged-in requests add `actor=<userId> company=<companyId>`; bootstrap key adds `actor=bootstrap company=all` |
+
+```bash
+npm start                      # LOG_LEVEL/LOG_REQUEST_BODY from .env.local
+LOG_LEVEL=debug npm start      # per-request in/out lines
+LOG_LEVEL=warn npm start       # only 4xx/5xx + errors
+```
+
+> Logs go to the console only (no file transport) by design — pipe or redirect stdout/stderr if you
+> need to persist them (e.g. `npm start > api.log 2>&1`).
 
 ## Available REST API Endpoints
 
