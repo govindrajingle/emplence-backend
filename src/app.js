@@ -3,10 +3,14 @@
 const express = require('express');
 
 const routes = require('./routes');
+const { logger, requestLogger } = require('./middleware/requestLogger');
 
 // The app only wires middleware and routes together, so it can be started
 // (or exercised) independently from the process/server bootstrap.
 const app = express();
+
+// Logging filter chain first: every request (404s and failures included) is logged.
+app.use(requestLogger);
 
 app.use(express.json());
 
@@ -26,9 +30,20 @@ app.use((req, res) => {
  */
 // eslint-disable-next-line no-unused-vars
 app.use((error, req, res, next) => {
-  console.error(`[error] ${req.method} ${req.originalUrl}:`, error.message);
-
   const statusCode = error.statusCode || 500;
+  const context = {
+    req: req.id,
+    status: statusCode,
+    method: req.method,
+    endpoint: req.originalUrl,
+  };
+
+  if (statusCode >= 500) {
+    logger.exception(`${req.method} ${req.originalUrl} failed`, error, context);
+  } else {
+    logger.warn(`${req.method} ${req.originalUrl} rejected: ${error.message}`, context);
+  }
+
   res.status(statusCode).json({
     message: statusCode === 500 ? 'Internal server error.' : error.message,
   });

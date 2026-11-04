@@ -10,6 +10,7 @@ const app = require('./app');
 const { closePool, getSslSummary } = require('./config/db');
 const databaseModel = require('./models/databaseModel');
 const roleModel = require('./models/roleModel');
+const { logger } = require('./middleware/requestLogger');
 
 const PORT = Number(process.env.PORT) || 3000;
 
@@ -41,10 +42,10 @@ const getLanUrls = (port) => {
 const connectDatabase = async () => {
   try {
     const { version, database } = await databaseModel.ping();
-    console.log(`[db] connected to "${database}" - ${version}`);
-    console.log(`[db] ssl: ${getSslSummary()}`);
+    logger.info(`[db] connected to "${database}" - ${version}`);
+    logger.info(`[db] ssl: ${getSslSummary()}`);
   } catch (error) {
-    console.error(`[db] connection failed: ${error.message}`);
+    logger.exception('[db] connection failed', error);
 
     // Guarded because an invalid DB_SSL_MODE makes the SSL config itself throw.
     const sslSummary = (() => {
@@ -56,12 +57,12 @@ const connectDatabase = async () => {
     })();
 
     if (sslSummary.startsWith('enabled')) {
-      console.error(
+      logger.error(
         '[db] if this is a local PostgreSQL container without TLS, use .env.local.example (DB_SSL_MODE=disable).',
       );
     }
 
-    console.error(
+    logger.error(
       '[db] check DATABASE_URL, DB_SSL_* settings, and that the database host allows connections from this network.',
     );
 
@@ -74,7 +75,7 @@ const connectDatabase = async () => {
 const initializeMasterData = async () => {
   try {
     const { inserted } = await roleModel.ensureDefaultRoles();
-    console.log(
+    logger.info(
       inserted.length > 0
         ? `[db] default roles seeded: ${inserted.join(', ')}`
         : '[db] default roles already present',
@@ -82,7 +83,7 @@ const initializeMasterData = async () => {
   } catch (error) {
     // 42P01 = undefined_table: schema not migrated yet. Keep the API usable and explain.
     if (error.code === '42P01') {
-      console.warn('[db] master tables are missing - run `npm run db:migrate` to create the schema.');
+      logger.warn('[db] master tables are missing - run `npm run db:migrate` to create the schema.');
       return;
     }
 
@@ -91,7 +92,7 @@ const initializeMasterData = async () => {
 };
 
 const start = async () => {
-  console.log(
+  logger.info(
     loadedEnvFiles.length > 0
       ? `[env] loaded ${loadedEnvFiles.map((filePath) => path.basename(filePath)).join(', ')}`
       : '[env] no env file found, using process environment only',
@@ -102,7 +103,7 @@ const start = async () => {
   try {
     await initializeMasterData();
   } catch (error) {
-    console.error(`[db] master data initialization failed: ${error.message}`);
+    logger.exception('[db] master data initialization failed', error);
     await closePool();
     process.exit(1);
   }
@@ -113,25 +114,27 @@ const start = async () => {
   }
 
   server = app.listen(listenOptions, () => {
-    console.log(`[server] listening on http://localhost:${PORT} (bind: ${SERVER_HOST || 'all interfaces'})`);
+    logger.info(
+      `[server] listening on http://localhost:${PORT} (bind: ${SERVER_HOST || 'all interfaces'})`,
+    );
 
     if (!SERVER_HOST || SERVER_HOST === '0.0.0.0' || SERVER_HOST === '::') {
       const lanUrls = getLanUrls(PORT);
       if (lanUrls.length > 0) {
-        console.log(`[server] reachable on your network: ${lanUrls.join(', ')}`);
+        logger.info(`[server] reachable on your network: ${lanUrls.join(', ')}`);
       }
     }
   });
 
   server.on('error', (error) => {
-    console.error(`[server] failed to start: ${error.message}`);
+    logger.exception('[server] failed to start', error);
     process.exit(1);
   });
 };
 
 /** Releases the HTTP server and the connection pool on termination signals. */
 const shutdown = async (signal) => {
-  console.log(`[server] ${signal} received, shutting down gracefully...`);
+  logger.info(`[server] ${signal} received, shutting down gracefully...`);
 
   if (server) {
     await new Promise((resolve) => server.close(resolve));
