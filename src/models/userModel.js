@@ -15,7 +15,8 @@ const roleModel = require('./roleModel');
  */
 
 // Only non-sensitive columns are ever returned to callers.
-const USER_COLUMNS = 'id, username, role_id, company_id, location_id, is_valid, dt_entry_date';
+const USER_COLUMNS =
+  'id, username, role_id, company_id, location_id, created_by_user_id, is_valid, dt_entry_date';
 
 /** Public registration always gets this role; ADMIN can never be self-assigned. */
 const PUBLIC_REGISTRATION_ROLE_CODE = 'EMPLOYEE';
@@ -99,10 +100,18 @@ const assertRoleExists = async (client, roleId) => {
  * Company/location are optional, but a location is only accepted when it
  * belongs to the supplied company.
  */
-const create = async ({ username, password, roleId, companyId, locationId }) => {
+const create = async ({
+  username,
+  password,
+  roleId,
+  companyId,
+  locationId,
+  createdByUserId = null,
+}) => {
   const name = validateCredentials({ username, password });
   const company = parseOptionalId(companyId, 'companyId');
   const location = parseOptionalId(locationId, 'locationId');
+  const createdBy = parseOptionalId(createdByUserId, 'createdByUserId');
 
   if (location !== null && company === null) {
     throw createAppError(400, 'locationId requires companyId.');
@@ -126,6 +135,14 @@ const create = async ({ username, password, roleId, companyId, locationId }) => 
         }
       }
 
+      if (createdBy !== null) {
+        const creatorRow = await client.query('SELECT id FROM users WHERE id = $1', [createdBy]);
+
+        if (creatorRow.rowCount === 0) {
+          throw createAppError(400, `Creating user ${createdBy} does not exist.`);
+        }
+      }
+
       if (location !== null) {
         const locationRow = await client.query(
           `SELECT id
@@ -143,10 +160,10 @@ const create = async ({ username, password, roleId, companyId, locationId }) => 
       }
 
       const { rows } = await client.query(
-        `INSERT INTO users (username, password, role_id, company_id, location_id)
-         VALUES ($1, $2, $3, $4, $5)
+        `INSERT INTO users (username, password, role_id, company_id, location_id, created_by_user_id)
+         VALUES ($1, $2, $3, $4, $5, $6)
          RETURNING ${USER_COLUMNS}`,
-        [name, passwordHash, resolvedRoleId, company, location],
+        [name, passwordHash, resolvedRoleId, company, location, createdBy],
       );
 
       return rows[0];
@@ -193,12 +210,18 @@ const findByUsername = async (username) => {
   return rows[0] ?? null;
 };
 
+/**
+ * Full user row with its role metadata (the source of truth for authorization).
+ * Includes inactive rows/users, so the caller decides how to react.
+ */
 const findById = async (id) => {
   const userId = parseId(id, 'userId');
 
   const { rows } = await getPool().query(
-    `SELECT u.id, u.username, u.role_id, r.role_code, r.hierarchy_level, r.company_id AS role_company_id,
-            u.company_id, u.location_id, u.is_valid, u.dt_entry_date
+    `SELECT u.id, u.username, u.role_id, u.company_id, u.location_id, u.created_by_user_id,
+            u.is_valid, u.dt_entry_date,
+            r.role_code, r.hierarchy_level, r.company_id AS role_company_id,
+            r.is_valid AS role_is_valid
        FROM users u
        JOIN master_roles r ON r.id = u.role_id
       WHERE u.id = $1`,
@@ -221,7 +244,8 @@ const findCredentialsByUsername = async (username) => {
 
   const { rows } = await getPool().query(
     `SELECT u.id, u.username, u.password, u.company_id, u.is_valid,
-            r.id AS role_id, r.role_code, r.hierarchy_level
+            r.id AS role_id, r.role_code, r.hierarchy_level,
+            r.company_id AS role_company_id, r.is_valid AS role_is_valid
        FROM users u
        JOIN master_roles r ON r.id = u.role_id
       WHERE lower(u.username) = lower($1)`,
@@ -232,10 +256,19 @@ const findCredentialsByUsername = async (username) => {
 };
 
 const USER_LIST_COLUMNS =
-  'u.id, u.username, u.role_id, r.role_code, u.company_id, u.location_id, u.is_valid, u.dt_entry_date';
+  'u.id, u.username, u.role_id, r.role_code, r.hierarchy_level, u.company_id, u.location_id, ' +
+  'u.created_by_user_id, u.is_valid, u.dt_entry_date';
 
-/** Users with their role code, optionally filtered by company/location. */
-const findAll = async ({ companyId, locationId, includeInvalid = false } = {}) => {
+/**
+ * Users with their role, optionally filtered by company/location.
+ * `hierarchyGreaterThan` is used to return only subordinates of the caller.
+ */
+const findAll = async ({
+  companyId,
+  locationId,
+  includeInvalid = false,
+  hierarchyGreaterThan,
+} = {}) => {
   const filters = [];
   const values = [];
 
@@ -247,6 +280,16 @@ const findAll = async ({ companyId, locationId, includeInvalid = false } = {}) =
     values.push(parseId(locationId, 'locationId'));
     filters.push(`u.location_id = $${values.length}`);
   }
+  if (hierarchyGreaterThan !== undefined && hierarchyGreaterThan !== null) {
+    const level = Number(hierarchyGreaterThan);
+
+    if (!Number.isSafeInteger(level) || level < 0) {
+      throw createAppError(400, 'hierarchyGreaterThan must be a non-negative integer.');
+    }
+
+    values.push(level);
+    filters.push(`r.hierarchy_level > $${values.length}`);
+  }
   if (!includeInvalid) {
     filters.push('u.is_valid = TRUE');
   }
@@ -256,7 +299,7 @@ const findAll = async ({ companyId, locationId, includeInvalid = false } = {}) =
        FROM users u
        JOIN master_roles r ON r.id = u.role_id
       ${filters.length > 0 ? `WHERE ${filters.join(' AND ')}` : ''}
-      ORDER BY u.username`,
+      ORDER BY r.hierarchy_level, u.username`,
     values,
   );
 

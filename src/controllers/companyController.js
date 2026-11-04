@@ -1,7 +1,7 @@
 'use strict';
 
 const companyModel = require('../models/companyModel');
-const { assertGlobalActor, isGlobalActor } = require('../middleware/auth');
+const { assertPlatformAdministrator, isGlobalActor } = require('../services/authorizationService');
 const { parseOptionalBoolean } = require('../utils/validation');
 
 /**
@@ -31,7 +31,7 @@ const list = async (req, res) => {
 
 /** POST /api/companies — platform administrator only. */
 const create = async (req, res) => {
-  assertGlobalActor(req.actor);
+  assertPlatformAdministrator(req.actor);
 
   const body = req.body ?? {};
 
@@ -45,7 +45,7 @@ const create = async (req, res) => {
 
 /** PUT /api/companies/:id — platform administrator only. */
 const update = async (req, res) => {
-  assertGlobalActor(req.actor);
+  assertPlatformAdministrator(req.actor);
 
   const company = await companyModel.update(req.params.id, req.body ?? {});
 

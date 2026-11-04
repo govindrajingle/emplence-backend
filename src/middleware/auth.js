@@ -2,19 +2,22 @@
 
 const jwt = require('jsonwebtoken');
 
+const rolePermissionModel = require('../models/rolePermissionModel');
+const userModel = require('../models/userModel');
+const { ALL_PERMISSIONS, isGlobalActor } = require('../services/authorizationService');
 const { assertAdminKey } = require('./adminKey');
 const { createAppError } = require('../utils/errors');
 
 /**
- * Authentication and tenant scoping.
+ * Authentication (identity) only.
  *
- * Two kinds of callers are accepted on `/api/*`:
- * 1. `x-admin-key: $ADMIN_API_KEY` — bootstrap/deployment key, treated as a
- *    global administrator (companyId = null, hierarchy 0).
- * 2. `Authorization: Bearer <jwt>` — a logged-in user (`POST /api/auth/login`).
- *    The token carries the user's role code, company scope and hierarchy level.
+ * `req.actor` is always built from trusted server-side data:
+ *   - JWT verified -> user id -> fresh user + role + permissions from PostgreSQL
+ *   - or the bootstrap `x-admin-key` (system principal, all permissions)
  *
- * Company users (sub-admins) can only touch records of their own company.
+ * Token claims (roleCode/companyId/hierarchyLevel) are informational for clients;
+ * authorization never reads them. All authorization rules live in
+ * `src/services/authorizationService.js`.
  */
 
 const ADMIN_ROLE_CODE = 'ADMIN';
@@ -39,10 +42,11 @@ const getTokenTtlSeconds = () => {
   return Number.isSafeInteger(ttl) && ttl > 0 ? ttl : DEFAULT_TOKEN_TTL_SECONDS;
 };
 
-/** Signs a session token for a logged-in user. */
+/** Signs a session token for a logged-in user (claims are advisory for clients). */
 const signToken = (user) =>
   jwt.sign(
     {
+      username: user.username,
       roleCode: user.role_code,
       companyId: user.company_id,
       hierarchyLevel: user.hierarchy_level,
@@ -63,21 +67,51 @@ const mapTokenError = (error) => {
   return error;
 };
 
+/** Loads the authenticated user + role + permissions and builds the actor. */
+const buildUserActor = async (userId) => {
+  const user = await userModel.findById(userId);
+
+  if (!user) {
+    throw createAppError(401, 'The account for this token no longer exists.');
+  }
+  if (!user.is_valid) {
+    throw createAppError(403, 'This account is inactive.');
+  }
+  if (!user.role_is_valid) {
+    throw createAppError(403, 'The role assigned to this account is inactive.');
+  }
+
+  return {
+    type: 'user',
+    userId: user.id,
+    username: user.username,
+    roleId: user.role_id,
+    roleCode: user.role_code,
+    companyId: user.company_id,
+    hierarchyLevel: Number(user.hierarchy_level),
+    roleCompanyId: user.role_company_id,
+    permissions: await rolePermissionModel.findCodesForRole(user.role_id),
+  };
+};
+
 /**
  * Resolves the caller into `req.actor`:
- * { type, userId, roleCode, companyId, hierarchyLevel }
- * `companyId: null` means the actor is not limited to one company.
+ * { type, userId, username, roleId, roleCode, companyId, hierarchyLevel, permissions }
  */
-const requireActor = (req, res, next) => {
+const requireActor = async (req, res, next) => {
   try {
     if (req.get('x-admin-key')) {
       assertAdminKey(req);
       req.actor = {
         type: 'bootstrap',
         userId: null,
+        username: 'bootstrap',
+        roleId: null,
         roleCode: ADMIN_ROLE_CODE,
         companyId: null,
         hierarchyLevel: 0,
+        roleCompanyId: null,
+        permissions: [...ALL_PERMISSIONS],
       };
 
       return next();
@@ -94,78 +128,11 @@ const requireActor = (req, res, next) => {
 
     const payload = jwt.verify(token, getJwtSecret());
 
-    req.actor = {
-      type: 'user',
-      userId: Number(payload.sub),
-      roleCode: payload.roleCode,
-      companyId: payload.companyId ?? null,
-      hierarchyLevel: Number(payload.hierarchyLevel) || 0,
-    };
+    req.actor = await buildUserActor(Number(payload.sub));
 
     next();
   } catch (error) {
     next(mapTokenError(error));
-  }
-};
-
-const isGlobalActor = (actor) => actor.companyId === null;
-
-/** Only administrators (global admin or a company sub-admin) manage users/roles. */
-const assertAdminActor = (actor) => {
-  if (actor.roleCode !== ADMIN_ROLE_CODE) {
-    throw createAppError(403, 'This operation requires the ADMIN role.');
-  }
-};
-
-const assertGlobalActor = (actor) => {
-  if (!isGlobalActor(actor)) {
-    throw createAppError(403, 'This operation is limited to the platform administrator.');
-  }
-};
-
-/** The company a write must target, given the caller's scope. */
-const resolveCompanyScope = (actor, requestedCompanyId) => {
-  if (isGlobalActor(actor)) {
-    return requestedCompanyId;
-  }
-
-  if (
-    requestedCompanyId !== undefined &&
-    requestedCompanyId !== null &&
-    requestedCompanyId !== '' &&
-    Number(requestedCompanyId) !== actor.companyId
-  ) {
-    throw createAppError(403, 'You can only manage records of your own company.');
-  }
-
-  return actor.companyId;
-};
-
-/** Read guard: a company user may only read its own company's records. */
-const assertCompanyRead = (actor, companyId) => {
-  if (!isGlobalActor(actor) && Number(companyId) !== actor.companyId) {
-    throw createAppError(403, 'You can only access records of your own company.');
-  }
-};
-
-/**
- * Company sub-admins may only grant roles that belong to their company (or a
- * global role) and whose hierarchy level is strictly below their own authority.
- */
-const assertRoleAssignable = (actor, role) => {
-  if (isGlobalActor(actor)) {
-    return;
-  }
-
-  if (role.company_id !== null && role.company_id !== actor.companyId) {
-    throw createAppError(403, 'That role belongs to another company.');
-  }
-
-  if (role.hierarchy_level <= actor.hierarchyLevel) {
-    throw createAppError(
-      403,
-      'You can only assign roles with a lower authority than your own (higher hierarchyLevel).',
-    );
   }
 };
 
@@ -176,9 +143,4 @@ module.exports = {
   signToken,
   requireActor,
   isGlobalActor,
-  assertAdminActor,
-  assertGlobalActor,
-  resolveCompanyScope,
-  assertCompanyRead,
-  assertRoleAssignable,
 };

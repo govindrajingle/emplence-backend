@@ -3,6 +3,7 @@
 const bcrypt = require('bcryptjs');
 
 const companyModel = require('../models/companyModel');
+const rolePermissionModel = require('../models/rolePermissionModel');
 const userModel = require('../models/userModel');
 const { getTokenTtlSeconds, signToken } = require('../middleware/auth');
 const { createAppError } = require('../utils/errors');
@@ -30,6 +31,10 @@ const login = async (req, res) => {
     throw createAppError(401, 'Invalid username or password.');
   }
 
+  if (!user.role_is_valid) {
+    throw createAppError(403, 'The role assigned to this account is inactive.');
+  }
+
   // A company user is bound to one company; global admins have company_id = null.
   const company = user.company_id === null ? null : await companyModel.findById(user.company_id);
 
@@ -38,6 +43,7 @@ const login = async (req, res) => {
   }
 
   const token = signToken(user);
+  const permissions = await rolePermissionModel.findCodesForRole(user.role_id);
 
   res.status(200).json({
     data: {
@@ -52,6 +58,7 @@ const login = async (req, res) => {
         hierarchyLevel: user.hierarchy_level,
         companyId: user.company_id,
         companyName: company?.company_name ?? null,
+        permissions,
       },
     },
   });

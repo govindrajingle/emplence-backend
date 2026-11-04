@@ -1,7 +1,11 @@
 'use strict';
 
 const locationModel = require('../models/companyLocationModel');
-const { assertCompanyRead, isGlobalActor, resolveCompanyScope } = require('../middleware/auth');
+const {
+  isGlobalActor,
+  resolveTargetCompany,
+  validateCompanyAccess,
+} = require('../services/authorizationService');
 const { createAppError } = require('../utils/errors');
 const { parseOptionalBoolean } = require('../utils/validation');
 
@@ -30,7 +34,7 @@ const list = async (req, res) => {
 /** POST /api/companies-locations — company is forced to the caller's company. */
 const create = async (req, res) => {
   const body = req.body ?? {};
-  const companyId = resolveCompanyScope(req.actor, body.companyId);
+  const companyId = resolveTargetCompany(req.actor, body.companyId);
 
   if (companyId === undefined || companyId === null || companyId === '') {
     throw createAppError(400, 'companyId is required.');
@@ -53,7 +57,7 @@ const update = async (req, res) => {
     throw createAppError(404, `Location ${req.params.id} was not found.`);
   }
 
-  assertCompanyRead(req.actor, existing.company_id);
+  validateCompanyAccess(req.actor, existing.company_id);
 
   const location = await locationModel.update(existing.id, req.body ?? {});
 
